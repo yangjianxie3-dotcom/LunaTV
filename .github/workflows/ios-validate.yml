@@ -64,12 +64,12 @@ jobs:
           test -f Payload/LunaTV.app/Assets.car
           find Payload/LunaTV.app -type f -name '*.m3u' -print -quit | grep -q .
           test -f Payload/LunaTV.app/lunatv-catalog-fallback.json
-          /usr/bin/zip -qry LunaTV-iOS-3.0.1.ipa Payload
+          /usr/bin/zip -qry LunaTV-iOS-3.0.2.ipa Payload
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v6
         with:
-          name: LunaTV-iOS-3.0.1
-          path: ios/LunaTV-iOS-3.0.1.ipa
+          name: LunaTV-iOS-3.0.2
+          path: ios/LunaTV-iOS-3.0.2.ipa
           if-no-files-found: error
           retention-days: 30
       - name: Publish versioned IPA for the scan page
@@ -78,6 +78,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "${GITHUB_REF_NAME}"
-          ios/LunaTV-iOS-3.0.1.ipa
-          --title "LunaTV iPhone 3.0.1"
-          --notes "网络稳定升级：Pages、家庭局域网与 Worker 三路共享服务并发容错；共享链路失败后依次使用 28 路直连、持久缓存和 5596 部安装包内置片库；单路失败不再拖垮整页。"
+          ios/LunaTV-iOS-3.0.2.ipa
+          --title "LunaTV iPhone 3.0.2"
+          --notes "片库展示升级：各地区剧集按首播年份优先；年份成为独立筛选条件；国漫保留全部内容并将常规动画置于短剧之前；共享目录继续使用 Pages、家庭局域网与 Worker 三路容错。"

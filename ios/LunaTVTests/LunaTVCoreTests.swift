@@ -203,8 +203,37 @@ final class LunaTVCoreTests: XCTestCase {
         XCTAssertEqual(seriesValues["category"], "动画")
         XCTAssertEqual(seriesValues["format"], "电视剧")
         XCTAssertEqual(seriesValues["region"], "中国大陆")
+        XCTAssertEqual(seriesValues["sort"], "U")
         XCTAssertEqual(theaterValues["kind"], "movie")
         XCTAssertEqual(theaterValues["format"], "all")
+    }
+
+    @MainActor
+    func testDisplayOrderingKeepsEveryTitleWhileDeferringAnimeShorts() {
+        let repository = ContentRepository()
+        let short = CatalogItem(id: "short", title: "灵境行者小剧场", section: .anime,
+                                category: "国产动漫", year: "2026")
+        let regular = CatalogItem(id: "regular", title: "普通国漫新作", section: .anime,
+                                  category: "国产动漫", year: "2026")
+        let flagship = CatalogItem(id: "flagship", title: "仙逆", section: .anime,
+                                   category: "国产动漫", year: "2023")
+        let ordered = repository.orderedForDisplay([short, regular, flagship],
+            filters: BrowseFilters(section: .anime, category: "在播国漫"))
+        XCTAssertEqual(ordered.map(\.id), ["flagship", "regular", "short"])
+        XCTAssertEqual(ordered.count, 3)
+    }
+
+    @MainActor
+    func testDramaDisplayUsesReleaseYearBeforeRefreshTimestamp() {
+        let repository = ContentRepository()
+        let oldRefreshed = CatalogItem(id: "old", title: "旧剧更新", section: .drama,
+                                       year: "1995", updatedAt: Date())
+        let current = CatalogItem(id: "new", title: "新剧", section: .drama,
+                                  year: "2026", updatedAt: .distantPast)
+        let ordered = repository.orderedForDisplay([oldRefreshed, current],
+            filters: BrowseFilters(section: .drama, category: "港剧"))
+        XCTAssertEqual(ordered.map(\.id), ["new", "old"])
+        XCTAssertEqual(ordered.count, 2)
     }
 
     func testCatalogDeduplicationCollapsesLanguageAndSeasonVariants() {

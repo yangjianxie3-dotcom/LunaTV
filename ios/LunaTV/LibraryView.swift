@@ -7,7 +7,7 @@ private struct LibraryLoadID: Hashable {
 
 struct LibraryView: View {
     @EnvironmentObject private var repository: ContentRepository
-    @State private var filters = BrowseFilters(section: .movie)
+    @State private var filters = BrowseFilters(section: .movie, sort: "近期更新")
     @State private var items: [CatalogItem] = []
     @State private var nextStart = 0
     @State private var isLoading = false
@@ -140,7 +140,7 @@ struct LibraryView: View {
             filters.region = "全部"
             filters.year = "全部"
             filters.platform = "全部"
-            filters.sort = "综合排序"
+            filters.sort = "近期更新"
         }
         .lunaBackground()
     }

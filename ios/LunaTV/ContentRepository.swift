@@ -285,7 +285,8 @@ final class ContentRepository: ObservableObject {
         let categorySort: String?
         switch filters.category {
         case "豆瓣高分": categorySort = "S"
-        case "最新电影", "最近热门", "每日放送", "在播国漫", "日本新番": categorySort = "R"
+        case "最新电影": categorySort = "R"
+        case "最近热门", "每日放送", "在播国漫", "日本新番": categorySort = "U"
         case "热门电影": categorySort = "U"
         default: categorySort = nil
         }
@@ -369,7 +370,8 @@ final class ContentRepository: ObservableObject {
         let retryNotice = status == "probe-unavailable" ? "，下一页将在联网后重试" : ""
         let routeLabel = url.host == "lunatv-vidaa-app.pages.dev" ? "Pages 中继"
             : (url.host == "192.168.1.181" ? "家庭局域网" : "共享 Worker")
-        return CatalogPageResult(items: items, nextStart: nextStart, hasMore: hasMore,
+        let orderedItems = sort(items, using: filters)
+        return CatalogPageResult(items: orderedItems, nextStart: nextStart, hasMore: hasMore,
                                  paginationStatus: status,
                                  notice: "电脑版共享目录 · \(routeLabel) · 同一剧集身份与播放源绑定" + retryNotice)
     }
@@ -1141,19 +1143,12 @@ final class ContentRepository: ObservableObject {
             if blocked.contains(where: classification.contains) { return false }
 
             if value.section == .anime {
-                if isLikelyShortFormAnime(item, descriptor: descriptor) { return false }
-
                 if animeEditorialRank(item) == Int.max {
                     let hasAnimationMetadata = ["动画", "动漫电影", "动画电影", "番剧"]
                         .contains(where: descriptor.localizedCaseInsensitiveContains)
                     let isJapaneseSeries = ["日本动漫", "日韩动漫", "番剧"]
                         .contains(where: classification.contains)
                     if !hasAnimationMetadata && !isJapaneseSeries { return false }
-                }
-
-                if value.category == "全部", value.year == "全部",
-                   animeEditorialRank(item) == Int.max, !isRecentAnime(item) {
-                    return false
                 }
 
                 if ["国产热播", "在播国漫"].contains(value.category) {
@@ -1191,6 +1186,9 @@ final class ContentRepository: ObservableObject {
         if filters.category == "豆瓣高分" { return items.sorted { ($0.score ?? 0) > ($1.score ?? 0) } }
         if filters.section == .anime {
             return items.sorted {
+                let lhsTier = animeDisplayTier($0)
+                let rhsTier = animeDisplayTier($1)
+                if lhsTier != rhsTier { return lhsTier < rhsTier }
                 let lhsRank = animeEditorialRank($0)
                 let rhsRank = animeEditorialRank($1)
                 if lhsRank != rhsRank { return lhsRank < rhsRank }
@@ -1222,6 +1220,19 @@ final class ContentRepository: ObservableObject {
     private func animeEditorialRank(_ item: CatalogItem) -> Int {
         let title = normalize(item.title)
         return featuredOnAirAnimeTitles.firstIndex { normalize($0) == title } ?? Int.max
+    }
+
+    private func animeDisplayTier(_ item: CatalogItem) -> Int {
+        if animeEditorialRank(item) != Int.max { return 0 }
+        let descriptor = [item.title, item.category, item.genre, item.region,
+                          item.platform, item.summary]
+            .joined(separator: " ").lowercased()
+        return isLikelyShortFormAnime(item, descriptor: descriptor) ? 2 : 1
+    }
+
+    /// Exposed to the test target: ordering must never change catalogue count.
+    func orderedForDisplay(_ items: [CatalogItem], filters: BrowseFilters) -> [CatalogItem] {
+        sort(items, using: filters)
     }
 
     private func isLikelyShortFormAnime(_ item: CatalogItem, descriptor: String) -> Bool {
@@ -1286,10 +1297,12 @@ final class ContentRepository: ObservableObject {
     }
 
     private func isFresher(_ lhs: CatalogItem, _ rhs: CatalogItem) -> Bool {
+        let lhsYear = Int(lhs.year.prefix(4)) ?? 0
+        let rhsYear = Int(rhs.year.prefix(4)) ?? 0
+        if lhsYear != rhsYear { return lhsYear > rhsYear }
         let lhsDate = lhs.updatedAt ?? .distantPast
         let rhsDate = rhs.updatedAt ?? .distantPast
         if lhsDate != rhsDate { return lhsDate > rhsDate }
-        if lhs.year != rhs.year { return lhs.year > rhs.year }
         return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
     }
 
