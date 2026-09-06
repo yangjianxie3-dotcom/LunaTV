@@ -26,11 +26,13 @@ final class LunaTVCoreTests: XCTestCase {
     }
 
     func testLegacyLocalUpdatePageMigratesToStableHTTPSPage() throws {
-        let legacy = Data(#"{
+        let legacy = Data(#"""
+        {
           "remoteConfigurationURL":"",
           "testFlightURL":"http://192.168.1.181:8799/ios/",
           "refreshIntervalSeconds":600
-        }"#.utf8)
+        }
+        """#.utf8)
         let preferences = try JSONDecoder().decode(AppPreferences.self, from: legacy)
         XCTAssertEqual(preferences.testFlightURL, AppPreferences.publicUpdateURL)
         XCTAssertEqual(AppPreferences().testFlightURL, AppPreferences.publicUpdateURL)
