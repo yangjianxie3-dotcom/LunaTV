@@ -139,7 +139,7 @@ struct CatalogItem: Identifiable, Codable, Hashable, Sendable {
         if let workID = workID?.trimmingCharacters(in: .whitespacesAndNewlines), !workID.isEmpty {
             return workID.lowercased() + ":" + section.rawValue
         }
-        MediaTitleIdentity.key(for: title) + ":" + section.rawValue
+        return MediaTitleIdentity.key(for: title) + ":" + section.rawValue
     }
 }
 
