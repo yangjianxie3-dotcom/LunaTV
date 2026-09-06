@@ -143,7 +143,7 @@ struct CatalogItem: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-struct CatalogPageResult: Sendable {
+struct CatalogPageResult: Codable, Sendable {
     var items: [CatalogItem]
     var nextStart: Int
     var hasMore: Bool

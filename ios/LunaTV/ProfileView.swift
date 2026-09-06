@@ -16,7 +16,7 @@ struct ProfileView: View {
                         .foregroundStyle(LunaTheme.accent)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("我的 LunaTV").font(.title3.bold())
-                        Text("已配置 \(repository.configuration.apiSites.count) 个播放源 · Wi‑Fi/蜂窝网络直连")
+                        Text("三路共享服务 · \(repository.configuration.apiSites.count) 路直连源 · 缓存与内置片库后备")
                             .font(.caption).foregroundStyle(.secondary)
                         Text(AppVersion.profileLabel())
                             .font(.caption).foregroundStyle(.secondary)
@@ -172,7 +172,7 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                    Text("电影、剧集、动漫、综艺、搜索与直播均从同一配置读取；前台每 10 分钟静默刷新。")
+                    Text("播放源配置与共享片库服务彼此独立。共享服务不可达时自动切换 Pages、家庭局域网、Worker、直连源、缓存和内置片库；前台每 10 分钟静默刷新。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("应用更新") {

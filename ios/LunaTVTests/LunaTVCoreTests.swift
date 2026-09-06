@@ -148,6 +148,45 @@ final class LunaTVCoreTests: XCTestCase {
     }
 
     @MainActor
+    func testSharedCatalogUsesThreeIndependentServiceRoutes() throws {
+        let repository = ContentRepository()
+        let urls = repository.sharedCatalogURLs(
+            filters: BrowseFilters(section: .drama, category: "大陆剧"),
+            start: 0, pageSize: 24)
+        XCTAssertEqual(urls.compactMap(\.host), [
+            "lunatv-vidaa-app.pages.dev",
+            "192.168.1.181",
+            "lunatv-vidaa-service.tw-iproyal-worker.workers.dev"
+        ])
+        XCTAssertTrue(urls[0].absoluteString.contains("/api/catalog"))
+        XCTAssertEqual(urls[1].port, 8787)
+    }
+
+    @MainActor
+    func testBundledCatalogProvidesOfflineHongKongDramaPage() throws {
+        let repository = ContentRepository()
+        let filters = BrowseFilters(section: .drama, category: "港剧")
+        let page = try XCTUnwrap(repository.bundledCatalogPage(filters: filters,
+                                                               start: 0, pageSize: 24))
+        XCTAssertEqual(page.items.count, 24)
+        XCTAssertTrue(page.hasMore)
+        XCTAssertEqual(page.paginationStatus, "bundled-fallback")
+        XCTAssertTrue(page.items.allSatisfy { $0.section == .drama })
+        XCTAssertTrue(page.items.allSatisfy { $0.sourceLabel == "安装包内置片库" })
+    }
+
+    func testCatalogPageResultCanBePersistedForOfflineReuse() throws {
+        let item = CatalogItem(id: "cached", title: "缓存剧集", section: .drama)
+        let original = CatalogPageResult(items: [item], nextStart: 24, hasMore: true,
+                                         paginationStatus: "more", notice: "在线目录")
+        let decoded = try JSONDecoder().decode(CatalogPageResult.self,
+                                                from: JSONEncoder().encode(original))
+        XCTAssertEqual(decoded.items, [item])
+        XCTAssertEqual(decoded.nextStart, 24)
+        XCTAssertTrue(decoded.hasMore)
+    }
+
+    @MainActor
     func testSharedCatalogQuerySeparatesAnimeSeriesAndTheater() throws {
         let repository = ContentRepository()
         let series = try XCTUnwrap(repository.sharedCatalogURL(

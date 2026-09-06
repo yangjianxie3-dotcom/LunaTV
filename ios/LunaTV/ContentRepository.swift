@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum RepositoryError: LocalizedError {
@@ -16,7 +17,12 @@ enum RepositoryError: LocalizedError {
 
 @MainActor
 final class ContentRepository: ObservableObject {
-    static let defaultSharedServiceURL = "https://lunatv-vidaa-service.tw-iproyal-worker.workers.dev"
+    static let defaultSharedServiceURLs = [
+        "https://lunatv-vidaa-app.pages.dev",
+        "http://192.168.1.181:8787",
+        "https://lunatv-vidaa-service.tw-iproyal-worker.workers.dev"
+    ]
+    static let defaultSharedServiceURL = defaultSharedServiceURLs[0]
 
     @Published private(set) var configuration = ContentConfiguration.empty
     @Published private(set) var lastRefresh: Date?
@@ -77,6 +83,27 @@ final class ContentRepository: ObservableObject {
         let url: String
     }
 
+    private struct BundledCatalogRoot: Decodable {
+        let sections: [String: [BundledCatalogItem]]
+    }
+
+    private struct BundledCatalogItem: Decodable {
+        let id: String
+        let title: String
+        let poster: String?
+        let year: String?
+        let area: String?
+        let type: String?
+        let remark: String?
+        let updateTime: String?
+        let aliases: [String]?
+    }
+
+    private struct PersistentCatalogPage: Codable {
+        let savedAt: Date
+        let result: CatalogPageResult
+    }
+
     /// Several CMS and metadata endpoints alternate between JSON strings and
     /// numbers for year fields. Decode both without invalidating the page.
     private struct LossyString: Decodable {
@@ -101,6 +128,8 @@ final class ContentRepository: ObservableObject {
     private var catalogCache: [String: CachedCatalog] = [:]
     private var siteClassCache: [String: [CMSClassEntry]] = [:]
     private let session: URLSession
+    private let sharedServiceBaseURLs: [String]
+    private let catalogCacheDirectory: URL?
 
     private let featuredOnAirAnimeTitles = [
         "完美世界", "遮天", "仙逆", "凡人修仙传", "光阴之外",
@@ -108,7 +137,7 @@ final class ContentRepository: ObservableObject {
         "斗罗大陆2绝世唐门", "诛仙", "沧元图", "灵笼", "一念永恒"
     ]
 
-    init() {
+    init(sharedServiceBaseURLs: [String] = ContentRepository.defaultSharedServiceURLs) {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 10
         configuration.timeoutIntervalForResource = 20
@@ -118,6 +147,19 @@ final class ContentRepository: ObservableObject {
         configuration.allowsExpensiveNetworkAccess = true
         configuration.allowsConstrainedNetworkAccess = true
         session = URLSession(configuration: configuration)
+        self.sharedServiceBaseURLs = sharedServiceBaseURLs.filter { value in
+            guard let scheme = URL(string: value)?.scheme?.lowercased() else { return false }
+            return ["http", "https"].contains(scheme)
+        }
+        if let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                              in: .userDomainMask).first {
+            let directory = applicationSupport.appendingPathComponent("LunaTV/CatalogCache", isDirectory: true)
+            try? FileManager.default.createDirectory(at: directory,
+                                                     withIntermediateDirectories: true)
+            catalogCacheDirectory = directory
+        } else {
+            catalogCacheDirectory = nil
+        }
     }
 
     func bootstrap(remoteConfigurationURL: String = "") async {
@@ -166,20 +208,50 @@ final class ContentRepository: ObservableObject {
     /// itself fails; a valid empty shared page remains empty.
     func catalogPage(filters: BrowseFilters, start: Int, pageSize: Int = 30) async -> CatalogPageResult {
         do {
-            return try await sharedCatalogPage(filters: filters, start: start, pageSize: pageSize)
+            let result = try await sharedCatalogPage(filters: filters, start: start, pageSize: pageSize)
+            savePersistentCatalogPage(result, filters: filters, start: start, pageSize: pageSize)
+            return result
         } catch {
             let legacyPage = max(0, start) / max(1, pageSize)
             let items = await catalog(filters: filters, page: legacyPage, pageSize: pageSize)
-            let nextStart = max(0, start) + items.count
-            return CatalogPageResult(items: items, nextStart: nextStart,
-                                     hasMore: items.count >= max(1, pageSize),
-                                     paginationStatus: "provider-fallback",
-                                     notice: "共享目录暂不可用，已读取同分类备用源")
+            if !items.isEmpty {
+                let nextStart = max(0, start) + items.count
+                let result = CatalogPageResult(items: items, nextStart: nextStart,
+                                               hasMore: items.count >= max(1, pageSize),
+                                               paginationStatus: "provider-fallback",
+                                               notice: "共享目录暂不可用，已读取 28 路配置中的同分类备用源")
+                savePersistentCatalogPage(result, filters: filters, start: start, pageSize: pageSize)
+                return result
+            }
+            if let cached = loadPersistentCatalogPage(filters: filters, start: start, pageSize: pageSize) {
+                var result = cached
+                result.notice = "网络暂不可用，正在显示上次成功加载的片库缓存"
+                result.paginationStatus = "persistent-cache"
+                return result
+            }
+            if let bundled = bundledCatalogPage(filters: filters, start: start, pageSize: pageSize) {
+                return bundled
+            }
+            return CatalogPageResult(items: [], nextStart: max(0, start), hasMore: false,
+                                     paginationStatus: "network-unavailable",
+                                     notice: "共享服务与播放源均暂不可用，且当前筛选没有可用缓存")
         }
     }
 
     func sharedCatalogURL(filters: BrowseFilters, start: Int, pageSize: Int) -> URL? {
-        guard var components = URLComponents(string: Self.defaultSharedServiceURL + "/api/catalog") else {
+        guard let baseURL = sharedServiceBaseURLs.first else { return nil }
+        return sharedCatalogURL(baseURL: baseURL, filters: filters, start: start, pageSize: pageSize)
+    }
+
+    func sharedCatalogURLs(filters: BrowseFilters, start: Int, pageSize: Int) -> [URL] {
+        sharedServiceBaseURLs.compactMap {
+            sharedCatalogURL(baseURL: $0, filters: filters, start: start, pageSize: pageSize)
+        }
+    }
+
+    private func sharedCatalogURL(baseURL: String, filters: BrowseFilters,
+                                  start: Int, pageSize: Int) -> URL? {
+        guard var components = URLComponents(string: baseURL + "/api/catalog") else {
             return nil
         }
         var kind = filters.section == .movie ? "movie" : "tv"
@@ -246,9 +318,30 @@ final class ContentRepository: ObservableObject {
 
     private func sharedCatalogPage(filters: BrowseFilters, start: Int,
                                    pageSize: Int) async throws -> CatalogPageResult {
-        guard let url = sharedCatalogURL(filters: filters, start: start, pageSize: pageSize) else {
+        let urls = sharedCatalogURLs(filters: filters, start: start, pageSize: pageSize)
+        guard !urls.isEmpty else {
             throw RepositoryError.invalidConfiguration
         }
+        return try await withThrowingTaskGroup(of: CatalogPageResult?.self) { group in
+            for url in urls {
+                group.addTask { [weak self] in
+                    guard let self else { return nil }
+                    return try? await self.fetchSharedCatalogPage(url: url, filters: filters,
+                                                                 start: start, pageSize: pageSize)
+                }
+            }
+            for try await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
+            }
+            throw RepositoryError.invalidResponse
+        }
+    }
+
+    private func fetchSharedCatalogPage(url: URL, filters: BrowseFilters, start: Int,
+                                        pageSize: Int) async throws -> CatalogPageResult {
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
@@ -274,9 +367,11 @@ final class ContentRepository: ObservableObject {
         let hasMore = (payload.hasMore ?? (payload.list.count >= max(1, pageSize))) && nextStart > start
         let status = payload.paginationStatus ?? (hasMore ? "more" : "end-confirmed")
         let retryNotice = status == "probe-unavailable" ? "，下一页将在联网后重试" : ""
+        let routeLabel = url.host == "lunatv-vidaa-app.pages.dev" ? "Pages 中继"
+            : (url.host == "192.168.1.181" ? "家庭局域网" : "共享 Worker")
         return CatalogPageResult(items: items, nextStart: nextStart, hasMore: hasMore,
                                  paginationStatus: status,
-                                 notice: "电脑版共享目录 · 同一剧集身份与播放源绑定" + retryNotice)
+                                 notice: "电脑版共享目录 · \(routeLabel) · 同一剧集身份与播放源绑定" + retryNotice)
     }
 
     private func inferredRegion(for filters: BrowseFilters) -> String {
@@ -372,16 +467,37 @@ final class ContentRepository: ObservableObject {
     }
 
     private func sharedSources(for item: CatalogItem) async throws -> [PlaybackSource] {
-        guard var components = URLComponents(string: Self.defaultSharedServiceURL + "/api/catalog/sources") else {
-            throw RepositoryError.invalidConfiguration
+        let urls = sharedServiceBaseURLs.compactMap { baseURL -> URL? in
+            guard var components = URLComponents(string: baseURL + "/api/catalog/sources") else {
+                return nil
+            }
+            components.queryItems = [
+                URLQueryItem(name: "title", value: item.title),
+                URLQueryItem(name: "workId", value: item.workID ?? ""),
+                URLQueryItem(name: "year", value: item.year),
+                URLQueryItem(name: "language", value: "")
+            ]
+            return components.url
         }
-        components.queryItems = [
-            URLQueryItem(name: "title", value: item.title),
-            URLQueryItem(name: "workId", value: item.workID ?? ""),
-            URLQueryItem(name: "year", value: item.year),
-            URLQueryItem(name: "language", value: "")
-        ]
-        guard let url = components.url else { throw RepositoryError.invalidConfiguration }
+        guard !urls.isEmpty else { throw RepositoryError.invalidConfiguration }
+        return try await withThrowingTaskGroup(of: [PlaybackSource]?.self) { group in
+            for url in urls {
+                group.addTask { [weak self] in
+                    guard let self else { return nil }
+                    return try? await self.fetchSharedSources(url: url, item: item)
+                }
+            }
+            for try await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
+            }
+            throw RepositoryError.invalidResponse
+        }
+    }
+
+    private func fetchSharedSources(url: URL, item: CatalogItem) async throws -> [PlaybackSource] {
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
@@ -565,6 +681,82 @@ final class ContentRepository: ObservableObject {
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         guard !sites.isEmpty else { throw RepositoryError.invalidConfiguration }
         return ContentConfiguration(cacheSeconds: cacheSeconds, apiSites: sites, liveSources: lives)
+    }
+
+    func bundledCatalogPage(filters: BrowseFilters, start: Int,
+                            pageSize: Int) -> CatalogPageResult? {
+        guard let url = Bundle.main.url(forResource: "lunatv-catalog-fallback", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let payload = try? JSONDecoder().decode(BundledCatalogRoot.self, from: data) else {
+            return nil
+        }
+        let sectionKeys: [String]
+        switch filters.section {
+        case .movie:
+            sectionKeys = ["movie"]
+        case .drama:
+            switch filters.category {
+            case "港剧": sectionKeys = ["hk"]
+            case "台剧": sectionKeys = ["tw"]
+            case "全部", "最近热门": sectionKeys = ["drama", "hk", "tw"]
+            default: sectionKeys = ["drama"]
+            }
+        case .anime:
+            sectionKeys = ["anime"]
+        case .variety:
+            sectionKeys = ["variety"]
+        }
+        let mapped = sectionKeys.flatMap { payload.sections[$0] ?? [] }.compactMap { row -> CatalogItem? in
+            let title = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return nil }
+            return CatalogItem(id: row.id, title: title, aliases: row.aliases ?? [],
+                               posterURL: row.poster.flatMap(URL.init(string:)),
+                               section: filters.section, category: row.type ?? "",
+                               genre: row.type ?? "", region: row.area ?? "", year: row.year ?? "",
+                               platform: row.remark ?? "", summary: "",
+                               sourceLabel: "安装包内置片库",
+                               updatedAt: row.updateTime.flatMap(parseDate))
+        }
+        let available = sort(filter(merge(mapped), using: filters), using: filters)
+        let safeStart = min(max(0, start), available.count)
+        let safeSize = max(1, pageSize)
+        let items = Array(available.dropFirst(safeStart).prefix(safeSize))
+        let nextStart = safeStart + items.count
+        return CatalogPageResult(items: items, nextStart: nextStart,
+                                 hasMore: nextStart < available.count,
+                                 paginationStatus: "bundled-fallback",
+                                 notice: "网络暂不可用，正在显示安装包内置片库；联网后会自动恢复最新目录")
+    }
+
+    private func savePersistentCatalogPage(_ result: CatalogPageResult, filters: BrowseFilters,
+                                           start: Int, pageSize: Int) {
+        guard !result.items.isEmpty,
+              let url = persistentCatalogURL(filters: filters, start: start, pageSize: pageSize),
+              let data = try? JSONEncoder().encode(PersistentCatalogPage(savedAt: Date(), result: result)) else {
+            return
+        }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private func loadPersistentCatalogPage(filters: BrowseFilters, start: Int,
+                                           pageSize: Int) -> CatalogPageResult? {
+        guard let url = persistentCatalogURL(filters: filters, start: start, pageSize: pageSize),
+              let data = try? Data(contentsOf: url),
+              let cached = try? JSONDecoder().decode(PersistentCatalogPage.self, from: data),
+              Date().timeIntervalSince(cached.savedAt) < 30 * 24 * 60 * 60 else {
+            return nil
+        }
+        return cached.result
+    }
+
+    private func persistentCatalogURL(filters: BrowseFilters, start: Int,
+                                      pageSize: Int) -> URL? {
+        guard let catalogCacheDirectory else { return nil }
+        let key = [filters.section.rawValue, filters.category, filters.genre, filters.region,
+                   filters.year, filters.platform, filters.sort, filters.weekday,
+                   String(max(0, start)), String(max(1, pageSize))].joined(separator: "|")
+        let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+        return catalogCacheDirectory.appendingPathComponent(digest + ".json", isDirectory: false)
     }
 
     private func querySites(_ sites: [APISite], queryItems: [URLQueryItem],

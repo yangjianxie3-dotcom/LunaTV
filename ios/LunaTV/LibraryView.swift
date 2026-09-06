@@ -88,7 +88,10 @@ struct LibraryView: View {
                 if isLoading && items.isEmpty {
                     LoadingStateView(title: "正在读取\(filters.section.rawValue)片库…")
                 } else if items.isEmpty {
-                    EmptyStateView(title: "当前筛选暂无结果", message: "可调整地区、年代或类型后重试。")
+                    EmptyStateView(title: "当前筛选暂无结果",
+                                   message: loadNotice.isEmpty
+                                       ? "可调整地区、年代或类型后重试。"
+                                       : loadNotice)
                 } else {
                     if !loadNotice.isEmpty {
                         Text(loadNotice)

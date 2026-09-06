@@ -10,6 +10,10 @@ struct HomeView: View {
         MediaSection.allCases.compactMap { sections[$0]?.first }.first
     }
 
+    private var hasCatalogContent: Bool {
+        sections.values.contains { !$0.isEmpty }
+    }
+
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 26) {
@@ -22,12 +26,15 @@ struct HomeView: View {
                 }
                 if isLoading && sections.isEmpty {
                     LoadingStateView(title: "正在聚合最新片库…")
-                } else {
+                } else if hasCatalogContent {
                     ForEach(MediaSection.allCases) { section in
                         if let items = sections[section], !items.isEmpty {
                             CatalogSectionRow(title: "最新\(section.rawValue)", items: items)
                         }
                     }
+                } else {
+                    EmptyStateView(title: "暂未读到片库",
+                                   message: "三路共享服务、28 路直连、历史缓存与内置片库当前均未返回内容，请稍后下拉重试。")
                 }
             }
             .padding()

@@ -8,6 +8,7 @@ on:
     paths:
       - "ios/**"
       - "config/lunatv-config.json"
+      - "config/lunatv-catalog-fallback.json"
       - ".github/workflows/ios-validate.yml"
 
 jobs:
@@ -62,12 +63,13 @@ jobs:
           test -f Payload/LunaTV.app/lunatv-config.json
           test -f Payload/LunaTV.app/Assets.car
           find Payload/LunaTV.app -type f -name '*.m3u' -print -quit | grep -q .
-          /usr/bin/zip -qry LunaTV-iOS-3.0.0.ipa Payload
+          test -f Payload/LunaTV.app/lunatv-catalog-fallback.json
+          /usr/bin/zip -qry LunaTV-iOS-3.0.1.ipa Payload
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v6
         with:
-          name: LunaTV-iOS-3.0.0
-          path: ios/LunaTV-iOS-3.0.0.ipa
+          name: LunaTV-iOS-3.0.1
+          path: ios/LunaTV-iOS-3.0.1.ipa
           if-no-files-found: error
           retention-days: 30
       - name: Publish versioned IPA for the scan page
@@ -76,6 +78,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "${GITHUB_REF_NAME}"
-          ios/LunaTV-iOS-3.0.0.ipa
-          --title "LunaTV iPhone 3.0.0"
-          --notes "共享完整目录与播放源绑定、作品身份和季度校验、港剧国语/粤语单海报切换、线路实测排序、系统横屏等比例播放，并迁移旧局域网更新地址到稳定 HTTPS 扫码页。"
+          ios/LunaTV-iOS-3.0.1.ipa
+          --title "LunaTV iPhone 3.0.1"
+          --notes "网络稳定升级：Pages、家庭局域网与 Worker 三路共享服务并发容错；共享链路失败后依次使用 28 路直连、持久缓存和 5596 部安装包内置片库；单路失败不再拖垮整页。"
