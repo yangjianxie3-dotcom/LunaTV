@@ -1,0 +1,40 @@
+name: LunaTViOS
+options:
+  bundleIdPrefix: com.lunatv
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "3.0.0"
+    CURRENT_PROJECT_VERSION: "7"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  LunaTV:
+    type: application
+    platform: iOS
+    sources:
+      - path: LunaTV
+      - path: Resources/Assets.xcassets
+        buildPhase: resources
+      - path: ../config/lunatv-config.json
+        buildPhase: resources
+      - path: ../public/playlists
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lunatv.mobile.ios
+        PRODUCT_NAME: LunaTV
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    scheme:
+      testTargets:
+        - LunaTVTests
+  LunaTVTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: LunaTVTests
+    dependencies:
+      - target: LunaTV
