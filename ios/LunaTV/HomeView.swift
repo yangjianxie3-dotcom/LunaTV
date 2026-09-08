@@ -5,6 +5,12 @@ struct HomeView: View {
     @EnvironmentObject private var persistence: PersistenceStore
     @State private var sections: [MediaSection: [CatalogItem]] = [:]
     @State private var isLoading = true
+    @ObservedObject private var network = NetworkMonitor.shared
+
+    private var recentRecords: [PlaybackRecord] {
+        var seen = Set<String>()
+        return Array(persistence.history.filter { seen.insert($0.item.id).inserted }.prefix(10))
+    }
 
     private var featuredItem: CatalogItem? {
         MediaSection.allCases.compactMap { sections[$0]?.first }.first
@@ -16,13 +22,45 @@ struct HomeView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 26) {
+            LazyVStack(alignment: .leading, spacing: 20) {
+                NetworkStatusStrip()
+                HStack(spacing: 8) {
+                    ForEach(MediaSection.allCases) { section in
+                        NavigationLink { LibraryView(initialSection: section) } label: {
+                            Text(section.rawValue).font(.subheadline.bold())
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                                .background(LunaTheme.surface, in: RoundedRectangle(cornerRadius: 12))
+                        }.buttonStyle(.plain)
+                    }
+                }
                 if let featuredItem {
                     featuredHero(featuredItem)
                 }
                 if !persistence.history.isEmpty {
-                    CatalogSectionRow(title: "继续观看",
-                                      items: Array(persistence.history.map(\.item).prefix(10)))
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("继续观看").font(.title3.bold())
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            LazyHStack(spacing: 12) {
+                                ForEach(recentRecords) { record in
+                                    NavigationLink(value: record.item) {
+                                        HStack(spacing: 12) {
+                                            PosterImageView(url: record.item.posterURL)
+                                                .frame(width: 52, height: 76).clipped()
+                                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                            VStack(alignment: .leading, spacing: 6) {
+                                                Text(record.item.title).font(.subheadline.bold()).lineLimit(1)
+                                                Text(record.episode.title).font(.caption).foregroundStyle(LunaTheme.secondaryText)
+                                                ProgressView(value: min(1, record.positionSeconds / max(1, record.durationSeconds)))
+                                                    .tint(LunaTheme.accent)
+                                                Text("已看 \(Int(record.positionSeconds / 60)) 分钟").font(.caption2)
+                                            }
+                                        }.padding(10).frame(width: 250)
+                                            .background(LunaTheme.surface, in: RoundedRectangle(cornerRadius: 12))
+                                    }.buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
                 }
                 if isLoading && sections.isEmpty {
                     LoadingStateView(title: "正在聚合最新片库…")
@@ -39,7 +77,11 @@ struct HomeView: View {
             }
             .padding()
         }
-        .navigationTitle("LunaTV")
+        .navigationTitle("YJTV")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: network.snapshot.generation) { _ in
+            if network.snapshot.isConnected && !hasCatalogContent && !isLoading { Task { await load() } }
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { Task { await refresh() } } label: {
@@ -59,15 +101,8 @@ struct HomeView: View {
     private func featuredHero(_ item: CatalogItem) -> some View {
         NavigationLink(value: item) {
             ZStack(alignment: .bottomLeading) {
-                AsyncImage(url: item.posterURL) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().scaledToFill()
-                    } else {
-                        LinearGradient(colors: [LunaTheme.raised, LunaTheme.surface],
-                                       startPoint: .topLeading, endPoint: .bottomTrailing)
-                    }
-                }
-                .frame(maxWidth: .infinity, minHeight: 220, maxHeight: 220)
+                PosterImageView(url: item.posterURL)
+                .frame(maxWidth: .infinity, minHeight: 186, maxHeight: 186)
                 .clipped()
 
                 LinearGradient(colors: [.clear, LunaTheme.background.opacity(0.97)],

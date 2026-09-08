@@ -3,6 +3,8 @@ name: Validate iOS client
 on:
   workflow_dispatch:
   push:
+    branches:
+      - "candidate/ios-*"
     tags:
       - "ios-v*"
     paths:
@@ -46,6 +48,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             test
       - name: Build unsigned IPA for personal signing
+        id: package
         working-directory: ios
         run: |
           xcodebuild \
@@ -64,12 +67,19 @@ jobs:
           test -f Payload/LunaTV.app/Assets.car
           find Payload/LunaTV.app -type f -name '*.m3u' -print -quit | grep -q .
           test -f Payload/LunaTV.app/lunatv-catalog-fallback.json
-          /usr/bin/zip -qry LunaTV-iOS-3.0.2.ipa Payload
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Payload/LunaTV.app/Info.plist)
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' Payload/LunaTV.app/Info.plist)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          /usr/bin/zip -qry "LunaTV-iOS-$VERSION.ipa" Payload
+          shasum -a 256 "LunaTV-iOS-$VERSION.ipa" > "LunaTV-iOS-$VERSION.ipa.sha256"
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v6
         with:
-          name: LunaTV-iOS-3.0.2
-          path: ios/LunaTV-iOS-3.0.2.ipa
+          name: LunaTV-iOS-${{ steps.package.outputs.version }}-build${{ steps.package.outputs.build }}-candidate
+          path: |
+            ios/LunaTV-iOS-*.ipa
+            ios/LunaTV-iOS-*.ipa.sha256
           if-no-files-found: error
           retention-days: 30
       - name: Publish versioned IPA for the scan page
@@ -78,6 +88,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "${GITHUB_REF_NAME}"
-          ios/LunaTV-iOS-3.0.2.ipa
-          --title "LunaTV iPhone 3.0.2"
-          --notes "片库展示升级：各地区剧集按首播年份优先；年份成为独立筛选条件；国漫保留全部内容并将常规动画置于短剧之前；共享目录继续使用 Pages、家庭局域网与 Worker 三路容错。"
+          "ios/LunaTV-iOS-${{ steps.package.outputs.version }}.ipa"
+          --title "LunaTV iPhone ${{ steps.package.outputs.version }}"
+          --notes "iPhone 原生版；安装需要用户正常签名。具体功能、实测记录及验收边界请查阅对应版本报告。"

@@ -14,6 +14,11 @@ struct LibraryView: View {
     @State private var hasMore = true
     @State private var lastAddedCount = 0
     @State private var loadNotice = ""
+    @ObservedObject private var network = NetworkMonitor.shared
+
+    init(initialSection: MediaSection = .movie) {
+        _filters = State(initialValue: BrowseFilters(section: initialSection, sort: "近期更新"))
+    }
 
     private let pageSize = 24
 
@@ -55,12 +60,13 @@ struct LibraryView: View {
     }
 
     private var years: [String] {
-        ["全部"] + stride(from: Calendar.current.component(.year, from: Date()), through: 1990, by: -1).map(String.init)
+        ["全部"] + stride(from: Calendar.current.component(.year, from: Date()), through: 1950, by: -1).map(String.init)
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                NetworkStatusStrip()
                 Picker("内容分类", selection: $filters.section) {
                     ForEach(MediaSection.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -92,6 +98,8 @@ struct LibraryView: View {
                                    message: loadNotice.isEmpty
                                        ? "可调整地区、年代或类型后重试。"
                                        : loadNotice)
+                    Button("重新加载") { Task { await load(reset: true) } }
+                        .buttonStyle(.bordered).disabled(isLoading)
                 } else {
                     if !loadNotice.isEmpty {
                         Text(loadNotice)
@@ -130,6 +138,10 @@ struct LibraryView: View {
             .padding(.bottom, 96)
         }
         .navigationTitle(filters.section.rawValue)
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: network.snapshot.generation) { _ in
+            if network.snapshot.isConnected && items.isEmpty && !isLoading { Task { await load(reset: true) } }
+        }
         .refreshable { await load(reset: true) }
         .task(id: LibraryLoadID(filters: filters, contentRevision: repository.contentRevision)) {
             await load(reset: true)

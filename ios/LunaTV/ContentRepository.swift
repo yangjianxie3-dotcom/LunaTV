@@ -127,7 +127,8 @@ final class ContentRepository: ObservableObject {
 
     private var catalogCache: [String: CachedCatalog] = [:]
     private var siteClassCache: [String: [CMSClassEntry]] = [:]
-    private let session: URLSession
+    private let transport = NetworkTransport()
+    private var session: URLSession { transport.session }
     private let sharedServiceBaseURLs: [String]
     private let catalogCacheDirectory: URL?
 
@@ -138,15 +139,6 @@ final class ContentRepository: ObservableObject {
     ]
 
     init(sharedServiceBaseURLs: [String] = ContentRepository.defaultSharedServiceURLs) {
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 10
-        configuration.timeoutIntervalForResource = 20
-        configuration.requestCachePolicy = .reloadRevalidatingCacheData
-        configuration.httpMaximumConnectionsPerHost = 4
-        configuration.allowsCellularAccess = true
-        configuration.allowsExpensiveNetworkAccess = true
-        configuration.allowsConstrainedNetworkAccess = true
-        session = URLSession(configuration: configuration)
         self.sharedServiceBaseURLs = sharedServiceBaseURLs.filter { value in
             guard let scheme = URL(string: value)?.scheme?.lowercased() else { return false }
             return ["http", "https"].contains(scheme)
@@ -187,6 +179,17 @@ final class ContentRepository: ObservableObject {
         await bootstrap(remoteConfigurationURL: remoteConfigurationURL)
     }
 
+    func networkDidChange(_ snapshot: NetworkSnapshot) {
+        transport.update(snapshot)
+        // Do not wipe posters, paging, selection, history, or healthy catalogue
+        // content because the system route changed.
+        siteClassCache.removeAll()
+    }
+
+    private var availableSharedURLs: [String] {
+        sharedServiceBaseURLs.filter { transport.snapshot.permitsHomeLAN || $0 != "http://192.168.1.181:8787" }
+    }
+
     func homeSections() async -> [MediaSection: [CatalogItem]] {
         await withTaskGroup(of: (MediaSection, [CatalogItem]).self) { group in
             for section in MediaSection.allCases {
@@ -207,11 +210,22 @@ final class ContentRepository: ObservableObject {
     /// query is retained only as an availability fallback when that request
     /// itself fails; a valid empty shared page remains empty.
     func catalogPage(filters: BrowseFilters, start: Int, pageSize: Int = 30) async -> CatalogPageResult {
+        if !transport.snapshot.isConnected {
+            if var cached = loadPersistentCatalogPage(filters: filters, start: start, pageSize: pageSize) {
+                cached.notice = "离线浏览：显示上次加载的片库，播放需要网络"
+                return cached
+            }
+            if let bundled = bundledCatalogPage(filters: filters, start: start, pageSize: pageSize) { return bundled }
+        }
         do {
             let result = try await sharedCatalogPage(filters: filters, start: start, pageSize: pageSize)
             savePersistentCatalogPage(result, filters: filters, start: start, pageSize: pageSize)
             return result
         } catch {
+            guard !Task.isCancelled else {
+                return CatalogPageResult(items: [], nextStart: start, hasMore: true,
+                                         paginationStatus: "cancelled", notice: "")
+            }
             let legacyPage = max(0, start) / max(1, pageSize)
             let items = await catalog(filters: filters, page: legacyPage, pageSize: pageSize)
             if !items.isEmpty {
@@ -244,7 +258,7 @@ final class ContentRepository: ObservableObject {
     }
 
     func sharedCatalogURLs(filters: BrowseFilters, start: Int, pageSize: Int) -> [URL] {
-        sharedServiceBaseURLs.compactMap {
+        availableSharedURLs.compactMap {
             sharedCatalogURL(baseURL: $0, filters: filters, start: start, pageSize: pageSize)
         }
     }
@@ -345,7 +359,7 @@ final class ContentRepository: ObservableObject {
                                         pageSize: Int) async throws -> CatalogPageResult {
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport.data(for: request)
         try validate(response: response)
         let payload = try JSONDecoder().decode(SharedCatalogResponse.self, from: data)
         let items = payload.list.compactMap { row -> CatalogItem? in
@@ -418,28 +432,34 @@ final class ContentRepository: ObservableObject {
         return items
     }
 
-    func search(_ query: String, limit: Int = 60) async -> [CatalogItem] {
+    func search(_ query: String, limit: Int = 60,
+                onProgress: (([CatalogItem]) -> Void)? = nil) async -> [CatalogItem] {
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !keyword.isEmpty else { return [] }
         let results = await querySites(configuration.apiSites, queryItems: [
             URLQueryItem(name: "ac", value: "videolist"),
             URLQueryItem(name: "wd", value: keyword)
-        ])
+        ], onProgress: { values in
+            onProgress?(Array(self.merge(values.map(\.item))
+                .sorted { self.searchRank($0, keyword: keyword) < self.searchRank($1, keyword: keyword) }.prefix(limit)))
+        })
         return Array(merge(results.map(\.item))
             .sorted { searchRank($0, keyword: keyword) < searchRank($1, keyword: keyword) }
             .prefix(limit))
     }
 
-    func sources(for item: CatalogItem) async -> [PlaybackSource] {
+    func sources(for item: CatalogItem, onDiscovery: (([PlaybackSource]) -> Void)? = nil) async -> [PlaybackSource] {
         do {
             let shared = try await sharedSources(for: item)
-            let checked = await probePlaybackStreams(in: Array(shared.prefix(12)))
-            return PlaybackSourceRank.sorted(checked + Array(shared.dropFirst(12)))
+            onDiscovery?(PlaybackSourceRank.sorted(shared))
+            let checked = await probePlaybackStreams(in: Array(shared.prefix(3)))
+            return PlaybackSourceRank.sorted(checked + Array(shared.dropFirst(3)))
         } catch {
             // Retain direct CMS lookup only for shared-service transport or
             // schema failures. A successful shared response, including an
             // empty one, is authoritative across all clients.
         }
+        guard !Task.isCancelled else { return [] }
         let variants = MediaTitleIdentity.searchVariants(for: item.title)
         let sites = configuration.apiSites
         let results = await withTaskGroup(of: [SiteResult].self) { group in
@@ -464,12 +484,13 @@ final class ContentRepository: ObservableObject {
             .sorted {
                 ($0.responseTimeMilliseconds ?? Int.max) < ($1.responseTimeMilliseconds ?? Int.max)
             }
-        let checked = await probePlaybackStreams(in: Array(candidates.prefix(12)))
-        return PlaybackSourceRank.sorted(checked + Array(candidates.dropFirst(12)))
+        onDiscovery?(PlaybackSourceRank.sorted(candidates))
+        let checked = await probePlaybackStreams(in: Array(candidates.prefix(3)))
+        return PlaybackSourceRank.sorted(checked + Array(candidates.dropFirst(3)))
     }
 
     private func sharedSources(for item: CatalogItem) async throws -> [PlaybackSource] {
-        let urls = sharedServiceBaseURLs.compactMap { baseURL -> URL? in
+        let urls = availableSharedURLs.compactMap { baseURL -> URL? in
             guard var components = URLComponents(string: baseURL + "/api/catalog/sources") else {
                 return nil
             }
@@ -502,7 +523,7 @@ final class ContentRepository: ObservableObject {
     private func fetchSharedSources(url: URL, item: CatalogItem) async throws -> [PlaybackSource] {
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport.data(for: request)
         try validate(response: response)
         let payload = try JSONDecoder().decode(SharedSourcesResponse.self, from: data)
         return payload.sources.compactMap { source -> PlaybackSource? in
@@ -560,8 +581,10 @@ final class ContentRepository: ObservableObject {
                 sample = try await transferSample(url: nextURL, using: session,
                                                   maximumBytes: isPlaylist ? 65_536 : 262_144)
             }
+            guard StreamProbePayload.isMediaSample(sample.data) else { return (.untested, nil, nil) }
             return (.verified, sample.latencyMilliseconds, sample.throughputKilobytesPerSecond)
         } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled { return (.untested, nil, nil) }
             return (.unavailable, nil, nil)
         }
     }
@@ -582,6 +605,7 @@ final class ContentRepository: ObservableObject {
         request.setValue("*/*", forHTTPHeaderField: "Accept")
         let startedAt = Date()
         let (bytes, response) = try await session.bytes(for: request)
+        defer { bytes.task.cancel() }
         guard let httpResponse = response as? HTTPURLResponse,
               (200..<400).contains(httpResponse.statusCode) else {
             throw RepositoryError.invalidResponse
@@ -595,6 +619,7 @@ final class ContentRepository: ObservableObject {
             if data.count >= maximumBytes || Date().timeIntervalSince(startedAt) >= 2.5 { break }
         }
         guard !data.isEmpty else { throw RepositoryError.noPlayableEpisode }
+        guard !StreamProbePayload.isErrorDocument(data) else { throw RepositoryError.invalidResponse }
         let firstByteDate = firstByteAt ?? Date()
         let latency = max(1, Int(firstByteDate.timeIntervalSince(startedAt) * 1_000))
         let transferDuration = max(0.001, Date().timeIntervalSince(firstByteDate))
@@ -636,7 +661,7 @@ final class ContentRepository: ObservableObject {
             if let userAgent = source.userAgent, !userAgent.isEmpty {
                 request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
             }
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await transport.data(for: request)
             try validate(response: response)
             text = String(decoding: data, as: UTF8.self)
         }
@@ -647,7 +672,7 @@ final class ContentRepository: ObservableObject {
         let trimmed = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             guard let url = URL(string: trimmed) else { throw RepositoryError.invalidConfiguration }
-            let (data, response) = try await session.data(from: url)
+            let (data, response) = try await transport.data(for: URLRequest(url: url))
             try validate(response: response)
             return try parseConfiguration(data)
         }
@@ -762,7 +787,8 @@ final class ContentRepository: ObservableObject {
     }
 
     private func querySites(_ sites: [APISite], queryItems: [URLQueryItem],
-                            loadDetails: Bool = false) async -> [SiteResult] {
+                            loadDetails: Bool = false,
+                            onProgress: (([SiteResult]) -> Void)? = nil) async -> [SiteResult] {
         await withTaskGroup(of: [SiteResult].self) { group in
             for site in sites {
                 group.addTask { [weak self] in
@@ -772,7 +798,11 @@ final class ContentRepository: ObservableObject {
                 }
             }
             var values: [SiteResult] = []
-            for await batch in group { values.append(contentsOf: batch) }
+            for await batch in group {
+                guard !Task.isCancelled else { group.cancelAll(); break }
+                values.append(contentsOf: batch)
+                if !batch.isEmpty { onProgress?(values) }
+            }
             return values
         }
     }
@@ -851,7 +881,7 @@ final class ContentRepository: ObservableObject {
     private func classEntries(for site: APISite) async -> [CMSClassEntry] {
         if let cached = siteClassCache[site.id] { return cached }
         guard var components = URLComponents(url: site.apiURL, resolvingAgainstBaseURL: false) else {
-            siteClassCache[site.id] = []
+            // A failed route must not become a permanent empty-class cache.
             return []
         }
         components.queryItems = (components.queryItems ?? []) + [URLQueryItem(name: "ac", value: "list")]
@@ -862,7 +892,7 @@ final class ContentRepository: ObservableObject {
         do {
             var request = URLRequest(url: url)
             request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await transport.data(for: request)
             try validate(response: response)
             guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let rawEntries = root["class"] as? [[String: Any]] else {
@@ -878,7 +908,7 @@ final class ContentRepository: ObservableObject {
             siteClassCache[site.id] = entries
             return entries
         } catch {
-            siteClassCache[site.id] = []
+            // Transport/parse failures are not authoritative empty classifications.
             return []
         }
     }
@@ -990,7 +1020,7 @@ final class ContentRepository: ObservableObject {
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
         let started = Date()
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport.data(for: request)
         try validate(response: response)
         let latency = Int(Date().timeIntervalSince(started) * 1_000)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1026,7 +1056,7 @@ final class ContentRepository: ObservableObject {
         guard let url = components.url else { return [] }
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await transport.data(for: request)
         try validate(response: response)
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let raw = (root["list"] as? [[String: Any]])?.first else { return [] }

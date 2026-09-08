@@ -8,10 +8,12 @@ struct SearchView: View {
     @State private var discoveryItems: [CatalogItem] = []
     @State private var isSearching = false
     @State private var errorMessage: String?
+    @ObservedObject private var network = NetworkMonitor.shared
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                NetworkStatusStrip()
                 if isSearching && results.isEmpty {
                     LoadingStateView(title: "正在查询全部播放源…")
                 } else if let errorMessage {
@@ -19,9 +21,11 @@ struct SearchView: View {
                 } else if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     discovery
                 } else if results.isEmpty {
-                    EmptyStateView(title: "没有匹配结果", message: "请尝试完整片名、中文别名或英文名。")
+                    EmptyStateView(title: network.snapshot.isConnected ? "没有匹配结果" : "网络暂时断开",
+                                   message: "可重试查询，或尝试完整片名、中文别名、英文名。")
+                    Button("重试搜索") { Task { await performSearch() } }.buttonStyle(.bordered)
                 } else {
-                    Text("找到 \(results.count) 部内容")
+                    Text("找到 \(results.count) 部内容\(isSearching ? " · 其余线路查询中" : "")")
                         .font(.subheadline)
                         .foregroundStyle(LunaTheme.secondaryText)
                     CatalogGrid(items: results)
@@ -34,7 +38,6 @@ struct SearchView: View {
                     prompt: "片名或别名")
         .onSubmit(of: .search) {
             persistence.rememberSearch(query)
-            Task { await performSearch() }
         }
         .task(id: query) {
             guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -104,7 +107,10 @@ struct SearchView: View {
         guard !value.isEmpty else { return }
         isSearching = true
         errorMessage = nil
-        let found = await repository.search(value)
+        let found = await repository.search(value) { partial in
+            guard !Task.isCancelled, value == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            results = partial
+        }
         guard !Task.isCancelled else { return }
         guard value == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
         results = found

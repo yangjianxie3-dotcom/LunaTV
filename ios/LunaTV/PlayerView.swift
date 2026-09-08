@@ -26,151 +26,6 @@ private enum PlayerOrientationController {
     }
 }
 
-@MainActor
-final class PlayerController: ObservableObject {
-    @Published private(set) var sourceIndex: Int
-    @Published private(set) var episodeIndex: Int
-    @Published private(set) var position: Double = 0
-    @Published private(set) var duration: Double = 0
-    @Published private(set) var isPlaying = false
-    @Published var errorMessage: String?
-
-    let player = AVPlayer()
-    let item: CatalogItem
-    let sources: [PlaybackSource]
-
-    private var timeObserver: Any?
-    private var statusObserver: NSKeyValueObservation?
-    private var completionObserver: NSObjectProtocol?
-    private var failedSources = Set<Int>()
-
-    init(item: CatalogItem, sources: [PlaybackSource], sourceIndex: Int, episodeIndex: Int) {
-        self.item = item
-        self.sources = sources
-        self.sourceIndex = max(0, min(sources.count - 1, sourceIndex))
-        self.episodeIndex = max(0, episodeIndex)
-        installTimeObserver()
-    }
-
-    var source: PlaybackSource? {
-        sources.indices.contains(sourceIndex) ? sources[sourceIndex] : nil
-    }
-
-    var episode: Episode? {
-        guard let source, source.episodes.indices.contains(episodeIndex) else { return nil }
-        return source.episodes[episodeIndex]
-    }
-
-    func start(resumeAt: Double) {
-        replaceCurrentItem(resumeAt: resumeAt)
-    }
-
-    func togglePlayback() {
-        if player.timeControlStatus == .playing { player.pause() }
-        else { player.play() }
-        isPlaying = player.timeControlStatus == .playing
-    }
-
-    func seek(to seconds: Double) {
-        let target = max(0, min(duration > 0 ? duration : seconds, seconds))
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
-                    toleranceBefore: .zero, toleranceAfter: .zero)
-        position = target
-    }
-
-    func seek(by seconds: Double) { seek(to: position + seconds) }
-
-    func selectEpisode(_ index: Int, resumeAt: Double = 0) {
-        guard let source, source.episodes.indices.contains(index) else { return }
-        episodeIndex = index
-        failedSources.removeAll()
-        replaceCurrentItem(resumeAt: resumeAt)
-    }
-
-    func selectSource(_ index: Int, resumeAt: Double = 0) {
-        guard sources.indices.contains(index), sources[index].episodes.indices.contains(episodeIndex) else { return }
-        sourceIndex = index
-        failedSources.removeAll()
-        replaceCurrentItem(resumeAt: resumeAt)
-    }
-
-    func previousEpisode() { selectEpisode(episodeIndex - 1) }
-    func nextEpisode() { selectEpisode(episodeIndex + 1) }
-
-    func stop() { player.pause() }
-
-    private func replaceCurrentItem(resumeAt: Double) {
-        guard let episode else {
-            errorMessage = "当前线路没有这一集"
-            return
-        }
-        statusObserver = nil
-        if let completionObserver { NotificationCenter.default.removeObserver(completionObserver) }
-        let playerItem = AVPlayerItem(url: episode.url)
-        player.replaceCurrentItem(with: playerItem)
-        statusObserver = playerItem.observe(\.status, options: [.new]) { [weak self] observed, _ in
-            Task { @MainActor in
-                guard let self else { return }
-                if observed.status == .failed { self.tryNextSource() }
-            }
-        }
-        completionObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime, object: playerItem, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                if let source = self.source, self.episodeIndex + 1 < source.episodes.count {
-                    self.nextEpisode()
-                } else {
-                    self.isPlaying = false
-                }
-            }
-        }
-        if resumeAt > 10 {
-            player.seek(to: CMTime(seconds: resumeAt, preferredTimescale: 600))
-        }
-        errorMessage = nil
-        player.play()
-        isPlaying = true
-    }
-
-    private func tryNextSource() {
-        failedSources.insert(sourceIndex)
-        let currentLanguage = source?.language
-        let sameLanguage = sources.indices.first(where: {
-            !failedSources.contains($0) && sources[$0].language == currentLanguage
-                && sources[$0].episodes.indices.contains(episodeIndex)
-        })
-        let anyLanguage = sources.indices.first(where: {
-            !failedSources.contains($0) && sources[$0].episodes.indices.contains(episodeIndex)
-        })
-        guard let next = sameLanguage ?? anyLanguage else {
-            errorMessage = "所有可用线路均播放失败"
-            isPlaying = false
-            return
-        }
-        sourceIndex = next
-        replaceCurrentItem(resumeAt: position)
-    }
-
-    private func installTimeObserver() {
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
-                                                      queue: .main) { [weak self] time in
-            Task { @MainActor in
-                guard let self else { return }
-                self.position = max(0, time.seconds.isFinite ? time.seconds : 0)
-                let seconds = self.player.currentItem?.duration.seconds ?? 0
-                self.duration = seconds.isFinite ? max(0, seconds) : 0
-                self.isPlaying = self.player.timeControlStatus == .playing
-            }
-        }
-    }
-
-    deinit {
-        if let timeObserver { player.removeTimeObserver(timeObserver) }
-        if let completionObserver { NotificationCenter.default.removeObserver(completionObserver) }
-    }
-}
 
 struct PlayerSurface: UIViewControllerRepresentable {
     let player: AVPlayer
@@ -198,6 +53,8 @@ struct PlayerView: View {
     @State private var showEpisodes = false
     @State private var showSources = false
     @State private var displayMode: PlayerDisplayMode = .standard
+    @State private var scrubPosition: Double = 0
+    @State private var isScrubbing = false
 
     init(item: CatalogItem, sources: [PlaybackSource], initialSourceIndex: Int, initialEpisodeIndex: Int) {
         _controller = StateObject(wrappedValue: PlayerController(item: item, sources: sources,
@@ -216,16 +73,32 @@ struct PlayerView: View {
                 }
 
             if showControls { controls }
+            if controller.isBuffering && controller.errorMessage == nil {
+                VStack(spacing: 10) {
+                    ProgressView().tint(.white)
+                    Text(controller.statusText).font(.subheadline)
+                }
+                .padding(18)
+                .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 14))
+                .allowsHitTesting(false)
+            }
             if let error = controller.errorMessage {
-                Text(error)
-                    .padding()
-                    .background(Color(red: 0, green: 0, blue: 0, opacity: 0.8), in: RoundedRectangle(cornerRadius: 12))
+                VStack(spacing: 14) {
+                    Text(error).font(.subheadline).multilineTextAlignment(.center)
+                    HStack {
+                        Button("保留进度重试") { controller.retry() }
+                        Button("选择线路") { showSources = true }
+                    }
+                    .buttonStyle(.borderedProminent).tint(LunaTheme.accent)
+                }
+                .padding(20).frame(maxWidth: 340)
+                .background(.black.opacity(0.9), in: RoundedRectangle(cornerRadius: 14))
             }
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .onAppear {
-            let resume = controller.episode.map { persistence.resumePosition(for: $0.url) } ?? 0
+            let resume = controller.episode.map { persistence.resumePosition(item: controller.item, episode: $0) } ?? 0
             controller.start(resumeAt: resume)
         }
         .onDisappear {
@@ -236,6 +109,10 @@ struct PlayerView: View {
         }
         .onChange(of: scenePhase) { phase in
             if phase != .active { saveProgress() }
+            controller.setForeground(phase == .active)
+        }
+        .onChange(of: controller.wantsPlayback) { playing in
+            if !playing { showControls = true }
         }
         .task {
             while !Task.isCancelled {
@@ -243,10 +120,11 @@ struct PlayerView: View {
                 if controller.isPlaying { saveProgress() }
             }
         }
-        .task(id: showControls) {
+        .task(id: "\(showControls)|\(controller.isPlaying)|\(isScrubbing)|\(showEpisodes)|\(showSources)") {
             guard showControls else { return }
             try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, controller.isPlaying, !isScrubbing,
+                  !showEpisodes, !showSources else { return }
             withAnimation(.easeInOut(duration: 0.18)) { showControls = false }
         }
         .sheet(isPresented: $showEpisodes) { episodeSheet }
@@ -261,8 +139,10 @@ struct PlayerView: View {
                 } label: { Label("返回", systemImage: "chevron.down") }
                 Spacer()
                 VStack(alignment: .trailing) {
-                    Text(controller.item.title).font(.headline)
+                    Text(controller.item.title).font(.headline).lineLimit(1)
                     Text(controller.episode?.title ?? "").font(.caption)
+                    Text("\(controller.selectedLanguage) · 已缓冲 \(Int(controller.bufferAhead)) 秒")
+                        .font(.caption2).foregroundStyle(.white.opacity(0.7))
                 }
             }
             .padding()
@@ -271,11 +151,18 @@ struct PlayerView: View {
             Spacer()
 
             VStack(spacing: 12) {
-                Slider(value: Binding(get: { controller.position }, set: { controller.seek(to: $0) }),
-                       in: 0...max(1, controller.duration))
+                Slider(value: Binding(get: { isScrubbing ? scrubPosition : min(controller.position, max(1, controller.duration)) },
+                                      set: { scrubPosition = $0 }),
+                       in: 0...max(1, controller.duration), onEditingChanged: { editing in
+                           if editing { scrubPosition = controller.position }
+                           isScrubbing = editing
+                           if !editing { controller.seek(to: scrubPosition) }
+                       })
                     .tint(LunaTheme.accent)
+                    .disabled(controller.duration <= 0)
+                    .accessibilityLabel("播放进度")
                 HStack {
-                    Text(format(controller.position))
+                    Text(format(isScrubbing ? scrubPosition : controller.position))
                     Spacer()
                     Text(format(controller.duration))
                 }
@@ -297,6 +184,7 @@ struct PlayerView: View {
                 primaryPlaybackButtons
                 controlButton("选集", "square.grid.3x3.fill") { showEpisodes = true }
                 controlButton("线路", "point.3.connected.trianglepath.dotted") { showSources = true }
+                speedMenu
                 fullscreenButton
             }
         } else {
@@ -305,6 +193,7 @@ struct PlayerView: View {
                 HStack(spacing: 16) {
                     controlButton("选集", "square.grid.3x3.fill") { showEpisodes = true }
                     controlButton("线路", "point.3.connected.trianglepath.dotted") { showSources = true }
+                    speedMenu
                     fullscreenButton
                 }
             }
@@ -317,8 +206,8 @@ struct PlayerView: View {
             saveProgress(); controller.previousEpisode()
         }
         controlButton("快退", "gobackward.10") { controller.seek(by: -10) }
-        controlButton(controller.isPlaying ? "暂停" : "播放",
-                      controller.isPlaying ? "pause.fill" : "play.fill") {
+        controlButton(controller.wantsPlayback ? "暂停" : "播放",
+                      controller.wantsPlayback ? "pause.fill" : "play.fill") {
             controller.togglePlayback()
         }
         controlButton("快进", "goforward.10") { controller.seek(by: 10) }
@@ -332,6 +221,19 @@ struct PlayerView: View {
         controlButton(displayMode.buttonTitle, displayMode.buttonIcon) { toggleFullscreen() }
     }
 
+    private var speedMenu: some View {
+        Menu {
+            ForEach([Float(0.75), 1, 1.25, 1.5, 2], id: \.self) { rate in
+                Button("\(rate.formatted()) 倍速") { controller.setRate(rate) }
+            }
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: "speedometer").font(.title3)
+                Text("\(controller.playbackRate.formatted())×").font(.caption)
+            }.frame(minWidth: 44, minHeight: 44)
+        }.accessibilityLabel("播放倍速")
+    }
+
     private func controlButton(_ title: String, _ image: String, enabled: Bool = true,
                                action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -339,7 +241,7 @@ struct PlayerView: View {
                 Image(systemName: image).font(.title3)
                 Text(title).font(.caption)
             }
-            .frame(minWidth: 58)
+            .frame(minWidth: 44, minHeight: 44)
         }
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.35)
@@ -348,18 +250,13 @@ struct PlayerView: View {
     private var episodeSheet: some View {
         NavigationStack {
             ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 68), spacing: 10)], spacing: 10) {
-                    ForEach(controller.source?.episodes ?? []) { episode in
-                        Button(episode.title) {
-                            saveProgress()
-                            controller.selectEpisode(episode.index,
-                                                     resumeAt: persistence.resumePosition(for: episode.url))
-                            showEpisodes = false
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(episode.index == controller.episodeIndex ? LunaTheme.accent : LunaTheme.surface)
-                    }
+                EpisodeGridView(episodes: controller.source?.episodes ?? [], currentIndex: controller.episodeIndex) { episode in
+                    saveProgress()
+                    controller.selectEpisode(episode.index,
+                        resumeAt: persistence.resumePosition(item: controller.item, episode: episode))
+                    showEpisodes = false
                 }
+                .id(controller.source?.id)
                 .padding()
             }
             .navigationTitle("快速选集")
@@ -370,29 +267,40 @@ struct PlayerView: View {
 
     private var sourceSheet: some View {
         NavigationStack {
-            List(controller.sources.indices, id: \.self) { index in
-                let source = controller.sources[index]
-                Button {
-                    saveProgress()
-                    controller.selectSource(index,
-                                            resumeAt: source.episodes.indices.contains(controller.episodeIndex)
-                                            ? persistence.resumePosition(for: source.episodes[controller.episodeIndex].url) : 0)
-                    showSources = false
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text("\(source.language) · 线路 \(index + 1) · \(source.streamHealth.title)")
-                            Text("\(source.name) · \(sourceSpeedDescription(source)) · \(source.episodes.count) 集")
-                                .font(.caption).foregroundStyle(.secondary)
+            List {
+                ForEach(Array(Set(controller.sources.map(\.language))).sorted(), id: \.self) { language in
+                    Section(language == controller.selectedLanguage ? "\(language) · 当前语种" : language) {
+                        ForEach(controller.sources.indices.filter { controller.sources[$0].language == language }, id: \.self) { index in
+                            let source = controller.sources[index]
+                            let matched = controller.matchingEpisodeIndex(in: index) != nil
+                            Button {
+                                saveProgress()
+                                controller.selectSource(index)
+                                showSources = false
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        Text(source.name).font(.subheadline.bold())
+                                        Text(matched ? "\(source.streamHealth.title) · \(sourceSpeedDescription(source))"
+                                             : "未匹配到当前分集，不自动跳集")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if index == controller.sourceIndex { Image(systemName: "checkmark.circle.fill") }
+                                }.padding(.vertical, 6)
+                            }
+                            .disabled(!matched)
                         }
-                        Spacer()
-                        if index == controller.sourceIndex { Image(systemName: "checkmark.circle.fill") }
                     }
                 }
-                .disabled(!source.episodes.indices.contains(controller.episodeIndex))
+                Section {
+                    Text("网络恢复只重连当前线路，不会自动换源或切换语种。请选择你要使用的线路；手动切换会保留进度，不同剪辑版本可能需要微调。测速仅代表探测时的网络情况。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
-            .navigationTitle("切换播放线路")
+            .navigationTitle("语种与播放线路")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { showSources = false } } }
         }
         .presentationDetents([.medium, .large])
     }

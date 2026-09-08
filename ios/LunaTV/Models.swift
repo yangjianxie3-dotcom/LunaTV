@@ -165,7 +165,7 @@ enum StreamHealth: String, Codable, Hashable, Sendable {
 
     var title: String {
         switch self {
-        case .verified: return "可播放"
+        case .verified: return "探测通过"
         case .untested: return "待检测"
         case .unavailable: return "暂不可用"
         }

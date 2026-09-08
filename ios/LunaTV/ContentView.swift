@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var repository: ContentRepository
     @EnvironmentObject private var persistence: PersistenceStore
+    @ObservedObject private var network = NetworkMonitor.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -20,10 +21,15 @@ struct ContentView: View {
         }
         .tint(LunaTheme.accent)
         .lunaBackground()
+        .onReceive(network.$snapshot) { repository.networkDidChange($0) }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { network.revalidateSystemRoute() }
+        }
         .task {
             await repository.bootstrap(remoteConfigurationURL: persistence.preferences.remoteConfigurationURL)
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(persistence.preferences.refreshIntervalSeconds))
+                guard !Task.isCancelled else { return }
                 guard scenePhase == .active else { continue }
                 await repository.refresh(remoteConfigurationURL: persistence.preferences.remoteConfigurationURL)
             }

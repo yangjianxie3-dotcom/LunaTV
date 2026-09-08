@@ -25,6 +25,9 @@ struct DetailView: View {
     @State private var selectedLanguage = "原声"
     @State private var isLoading = true
     @State private var route: PlayerRoute?
+    @State private var sourceTask: Task<Void, Never>?
+    @State private var isProbing = false
+    @ObservedObject private var network = NetworkMonitor.shared
 
     private var selectedSource: PlaybackSource? {
         sources.indices.contains(selectedSourceIndex) ? sources[selectedSourceIndex] : nil
@@ -59,6 +62,7 @@ struct DetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                NetworkStatusStrip()
                 hero
                 sourceSelector
                 episodeSelector
@@ -76,15 +80,11 @@ struct DetailView: View {
             }
         }
         .task(id: item.id) {
-            isLoading = true
-            sources = await repository.sources(for: item)
-            selectedSourceIndex = preferredSourceIndex()
-            if sources.indices.contains(selectedSourceIndex) {
-                selectedLanguage = sources[selectedSourceIndex].language
-            } else if let first = availableLanguages.first {
-                selectedLanguage = first
-            }
-            isLoading = false
+            loadSources()
+        }
+        .onDisappear { sourceTask?.cancel() }
+        .onChange(of: network.snapshot.generation) { _ in
+            if route == nil && network.snapshot.isConnected { loadSources() }
         }
         .fullScreenCover(item: $route) { route in
             PlayerView(item: route.item, sources: route.sources,
@@ -98,18 +98,7 @@ struct DetailView: View {
     private var hero: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 18) {
-                AsyncImage(url: item.posterURL) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().scaledToFill()
-                    } else {
-                        ZStack {
-                            LunaTheme.surface
-                            Image(systemName: "play.tv.fill")
-                                .font(.largeTitle)
-                                .foregroundStyle(LunaTheme.accent)
-                        }
-                    }
-                }
+                PosterImageView(url: item.posterURL)
                 .frame(width: 132, height: 198)
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
@@ -152,6 +141,7 @@ struct DetailView: View {
             } else if sources.isEmpty {
                 Text("片库有该内容，但当前配置源没有返回可播放版本。可返回搜索尝试其他片名。")
                     .foregroundStyle(LunaTheme.secondaryText)
+                Button("重新匹配线路") { loadSources() }.buttonStyle(.bordered)
             } else {
                 if availableLanguages.count > 1 {
                     Text("语种").font(.headline)
@@ -169,7 +159,7 @@ struct DetailView: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text("播放线路").font(.headline)
                     Spacer()
-                    Text("已按实测缓存速度排序")
+                    Text(isProbing ? "后台测速中，可直接播放" : "已测线路优先 · 其余保留")
                         .font(.caption)
                         .foregroundStyle(LunaTheme.secondaryText)
                 }
@@ -214,13 +204,11 @@ struct DetailView: View {
         if let source = selectedSource, !source.episodes.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
                 Text("快速选集 · \(source.episodes.count) 集").font(.headline)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 72), spacing: 10)], spacing: 10) {
-                    ForEach(source.episodes) { episode in
-                        Button(shortEpisodeTitle(episode)) { play(episodeIndex: episode.index) }
-                            .buttonStyle(.bordered)
-                            .tint(LunaTheme.accent)
+                EpisodeGridView(episodes: source.episodes,
+                    currentIndex: max(0, (persistence.history.first(where: { $0.item.id == item.id })?.episode.index ?? 0))) { episode in
+                        play(episodeIndex: episode.index)
                     }
-                }
+                    .id(source.id)
             }
         }
     }
@@ -228,6 +216,8 @@ struct DetailView: View {
     private func play(episodeIndex: Int) {
         guard !sources.isEmpty, sources.indices.contains(selectedSourceIndex),
               sources[selectedSourceIndex].episodes.indices.contains(episodeIndex) else { return }
+        sourceTask?.cancel() // Do not compete with playback for media bandwidth.
+        isProbing = false
         route = PlayerRoute(item: item, sources: sources,
                             sourceIndex: selectedSourceIndex, episodeIndex: episodeIndex)
     }
@@ -270,9 +260,35 @@ struct DetailView: View {
 
     private func preferredEpisodeIndex() -> Int {
         guard let source = selectedSource,
-              let record = persistence.history.first(where: { $0.item.id == item.id && $0.sourceID == source.id }),
-              let index = source.episodes.firstIndex(where: { $0.url == record.episode.url }) else { return 0 }
+              let record = persistence.history.first(where: { $0.item.id == item.id }),
+              let index = EpisodeIdentity.matchingIndex(for: record.episode, in: source.episodes) else { return 0 }
         return index
+    }
+
+    private func loadSources() {
+        sourceTask?.cancel()
+        isLoading = sources.isEmpty
+        isProbing = true
+        sourceTask = Task { @MainActor in
+            let checked = await repository.sources(for: item) { discovered in
+                guard !Task.isCancelled, route == nil else { return }
+                applySources(discovered)
+                isLoading = false
+            }
+            guard !Task.isCancelled, route == nil else { return }
+            applySources(checked)
+            isLoading = false
+            isProbing = false
+        }
+    }
+
+    private func applySources(_ values: [PlaybackSource]) {
+        guard !values.isEmpty || sources.isEmpty else { return }
+        let selectedID = selectedSource?.id
+        sources = values
+        selectedSourceIndex = selectedID.flatMap { id in sources.firstIndex { $0.id == id } }
+            ?? preferredSourceIndex()
+        if let source = selectedSource { selectedLanguage = source.language }
     }
 
     private func shortEpisodeTitle(_ episode: Episode) -> String {

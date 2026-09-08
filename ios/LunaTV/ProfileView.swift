@@ -15,7 +15,7 @@ struct ProfileView: View {
                         .font(.system(size: 34))
                         .foregroundStyle(LunaTheme.accent)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("我的 LunaTV").font(.title3.bold())
+                        Text("我的 YJTV").font(.title3.bold())
                         Text("三路共享服务 · \(repository.configuration.apiSites.count) 路直连源 · 缓存与内置片库后备")
                             .font(.caption).foregroundStyle(.secondary)
                         Text(AppVersion.profileLabel())
@@ -70,7 +70,7 @@ struct ProfileView: View {
         .alert("iOS 应用更新", isPresented: $showUpdateHelp) {
             Button("知道了", role: .cancel) { }
         } message: {
-            Text("请先在 iPhone 安装 AltStore，再打开 LunaTV 更新页安装新版。普通 Apple ID 免费签名需要定期刷新；iOS 不允许未签名 App 静默覆盖安装。")
+            Text("请先在 iPhone 安装 AltStore，再打开 YJTV 更新页安装新版。普通 Apple ID 免费签名需要定期刷新；iOS 不允许未签名 App 静默覆盖安装。")
         }
         .lunaBackground()
     }
@@ -172,7 +172,7 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                    Text("播放源配置与共享片库服务彼此独立。共享服务不可达时自动切换 Pages、家庭局域网、Worker、直连源、缓存和内置片库；前台每 10 分钟静默刷新。")
+                    Text("目录请求可在共享服务、直连源与缓存之间恢复，前台每 10 分钟静默刷新。视频播放只重连你已选择的线路，其他线路和语种始终由你自行选择，不会自动换源。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("应用更新") {
@@ -180,7 +180,7 @@ struct SettingsView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                    Text("默认打开当前 LunaTV iPhone 更新页；也可改成你的 TestFlight 或 AltStore Source 地址。免费签名需要定期刷新。")
+                    Text("默认打开当前 YJTV iPhone 更新页；也可改成你的 TestFlight 或 AltStore Source 地址。免费签名需要定期刷新。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

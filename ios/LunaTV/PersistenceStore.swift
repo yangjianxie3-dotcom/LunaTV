@@ -41,9 +41,19 @@ final class PersistenceStore: ObservableObject {
         history.first(where: { $0.episode.url == episodeURL })?.positionSeconds ?? 0
     }
 
+    func resumePosition(item: CatalogItem, episode: Episode) -> Double {
+        history.first {
+            $0.item.id == item.id && EpisodeIdentity.matchingIndex(for: $0.episode, in: [episode]) != nil
+        }?.positionSeconds ?? 0
+    }
+
     func updateHistory(item: CatalogItem, sourceID: String, episode: Episode,
                        position: Double, duration: Double) {
-        history.removeAll { $0.episode.url == episode.url }
+        guard position.isFinite, duration.isFinite else { return }
+        history.removeAll {
+            $0.episode.url == episode.url || ($0.item.id == item.id
+                && EpisodeIdentity.matchingIndex(for: $0.episode, in: [episode]) != nil)
+        }
         guard duration <= 0 || position < max(0, duration - 15) else {
             save(history, key: Keys.history)
             return
