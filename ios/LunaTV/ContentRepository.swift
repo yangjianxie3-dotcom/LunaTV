@@ -62,6 +62,19 @@ final class ContentRepository: ObservableObject {
         let year: LossyString?
     }
 
+    private struct SharedWorkSearchResponse: Decodable {
+        let list: [SharedWorkSearchItem]
+    }
+
+    private struct SharedWorkSearchItem: Decodable {
+        let id: String?
+        let workId: String?
+        let title: String
+        let year: LossyString?
+        let poster: String?
+        let type: String?
+    }
+
     private struct SharedSourcesResponse: Decodable {
         let sources: [SharedSource]
     }
@@ -126,6 +139,7 @@ final class ContentRepository: ObservableObject {
     }
 
     private var catalogCache: [String: CachedCatalog] = [:]
+    private var bundledCatalogCache: BundledCatalogRoot?
     private var siteClassCache: [String: [CMSClassEntry]] = [:]
     private let transport = NetworkTransport()
     private var session: URLSession { transport.session }
@@ -436,16 +450,103 @@ final class ContentRepository: ObservableObject {
                 onProgress: (([CatalogItem]) -> Void)? = nil) async -> [CatalogItem] {
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !keyword.isEmpty else { return [] }
+        let local = bundledSearch(keyword, limit: limit)
+        onProgress?(local)
+        if !Task.isCancelled, let live = try? await sharedWorkSearch(keyword, limit: limit), !live.isEmpty {
+            let works = WorkSearchIndex.merge(live + local, query: keyword, limit: limit)
+            onProgress?(works)
+            return works
+        }
+        guard !Task.isCancelled, !configuration.apiSites.isEmpty else { return local }
         let results = await querySites(configuration.apiSites, queryItems: [
             URLQueryItem(name: "ac", value: "videolist"),
             URLQueryItem(name: "wd", value: keyword)
         ], onProgress: { values in
-            onProgress?(Array(self.merge(values.map(\.item))
-                .sorted { self.searchRank($0, keyword: keyword) < self.searchRank($1, keyword: keyword) }.prefix(limit)))
+            onProgress?(WorkSearchIndex.merge(local + values.map(\.item), query: keyword, limit: limit))
         })
-        return Array(merge(results.map(\.item))
-            .sorted { searchRank($0, keyword: keyword) < searchRank($1, keyword: keyword) }
-            .prefix(limit))
+        return WorkSearchIndex.merge(local + results.map(\.item), query: keyword, limit: limit)
+    }
+
+    private func sharedWorkSearch(_ query: String, limit: Int) async throws -> [CatalogItem] {
+        let urls = availableSharedURLs.compactMap { baseURL -> URL? in
+            guard var components = URLComponents(string: baseURL + "/api/catalog/search") else { return nil }
+            components.queryItems = [URLQueryItem(name: "q", value: query),
+                                     URLQueryItem(name: "limit", value: String(min(50, max(1, limit))))]
+            return components.url
+        }
+        guard !urls.isEmpty else { throw RepositoryError.invalidConfiguration }
+        return try await withThrowingTaskGroup(of: [CatalogItem]?.self) { group in
+            for url in urls {
+                group.addTask { [weak self] in
+                    guard let self else { return nil }
+                    return try? await self.fetchSharedWorkSearch(url: url)
+                }
+            }
+            for try await result in group {
+                if let result {
+                    group.cancelAll()
+                    return result
+                }
+            }
+            throw RepositoryError.invalidResponse
+        }
+    }
+
+    private func fetchSharedWorkSearch(url: URL) async throws -> [CatalogItem] {
+        var request = URLRequest(url: url)
+        request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await transport.data(for: request)
+        try validate(response: response)
+        let payload = try JSONDecoder().decode(SharedWorkSearchResponse.self, from: data)
+        return payload.list.compactMap { row -> CatalogItem? in
+            let title = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { return nil }
+            let workID = row.workId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let id = (workID?.isEmpty == false ? workID : nil) ?? row.id ?? title
+            let type = row.type ?? ""
+            let section: MediaSection
+            if type.contains("动漫") || type.contains("动画") { section = .anime }
+            else if type.contains("电影") { section = .movie }
+            else if type.contains("综艺") { section = .variety }
+            else { section = .drama }
+            return CatalogItem(id: id, workID: workID, title: title,
+                               posterURL: row.poster.flatMap(URL.init(string:)),
+                               section: section, category: type, genre: type,
+                               year: row.year?.value ?? "", sourceLabel: "共享实时作品搜索")
+        }
+    }
+
+    func bundledSearch(_ query: String, limit: Int = 60) -> [CatalogItem] {
+        guard let payload = loadBundledCatalog() else { return [] }
+        let wanted = MediaTitleIdentity.key(for: query)
+        guard !wanted.isEmpty else { return [] }
+        let sections: [(String, MediaSection)] = [
+            ("movie", .movie), ("drama", .drama), ("anime", .anime),
+            ("variety", .variety), ("hk", .drama), ("tw", .drama)
+        ]
+        let matches = sections.flatMap { key, section in
+            (payload.sections[key] ?? []).compactMap { row -> CatalogItem? in
+                let title = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let searchable = [title] + (row.aliases ?? [])
+                guard searchable.contains(where: { MediaTitleIdentity.key(for: $0).contains(wanted) }) else { return nil }
+                return CatalogItem(id: row.id, title: title, aliases: row.aliases ?? [],
+                                   posterURL: row.poster.flatMap(URL.init(string:)),
+                                   section: section, category: row.type ?? "", genre: row.type ?? "",
+                                   region: row.area ?? "", year: row.year ?? "",
+                                   platform: row.remark ?? "", sourceLabel: "安装包内置片库",
+                                   updatedAt: row.updateTime.flatMap(parseDate))
+            }
+        }
+        return WorkSearchIndex.merge(matches, query: query, limit: limit)
+    }
+
+    private func loadBundledCatalog() -> BundledCatalogRoot? {
+        if let bundledCatalogCache { return bundledCatalogCache }
+        guard let url = Bundle.main.url(forResource: "lunatv-catalog-fallback", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let payload = try? JSONDecoder().decode(BundledCatalogRoot.self, from: data) else { return nil }
+        bundledCatalogCache = payload
+        return payload
     }
 
     func sources(for item: CatalogItem, onDiscovery: (([PlaybackSource]) -> Void)? = nil) async -> [PlaybackSource] {
@@ -476,8 +577,16 @@ final class ContentRepository: ObservableObject {
             for await batch in group { values.append(contentsOf: batch) }
             return values
         }
-        let wanted = item.deduplicationKey
-        let matches = results.filter { $0.item.deduplicationKey == wanted }
+        // Shared search identities are work:search:* while direct CMS rows have
+        // provider IDs. Compare installment + compatible year, never provider ID.
+        let wantedTitle = MediaTitleIdentity.key(for: item.title)
+        let wantedYear = String(item.year.prefix(4))
+        let matches = results.filter { candidate in
+            let candidateYear = String(candidate.item.year.prefix(4))
+            return candidate.item.section == item.section &&
+                MediaTitleIdentity.key(for: candidate.item.title) == wantedTitle &&
+                (wantedYear.isEmpty || candidateYear.isEmpty || wantedYear == candidateYear)
+        }
         var seen = Set<String>()
         let candidates = matches.map(\.source)
             .filter { !$0.episodes.isEmpty && seen.insert($0.id).inserted }
@@ -712,9 +821,7 @@ final class ContentRepository: ObservableObject {
 
     func bundledCatalogPage(filters: BrowseFilters, start: Int,
                             pageSize: Int) -> CatalogPageResult? {
-        guard let url = Bundle.main.url(forResource: "lunatv-catalog-fallback", withExtension: "json"),
-              let data = try? Data(contentsOf: url),
-              let payload = try? JSONDecoder().decode(BundledCatalogRoot.self, from: data) else {
+        guard let payload = loadBundledCatalog() else {
             return nil
         }
         let sectionKeys: [String]

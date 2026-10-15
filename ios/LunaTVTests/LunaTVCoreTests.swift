@@ -128,6 +128,30 @@ final class LunaTVCoreTests: XCTestCase {
         XCTAssertNotEqual(first.deduplicationKey, second.deduplicationKey)
     }
 
+    func testWorkSearchMergesProviderPostersButKeepsSeasonsAndYears() {
+        let watched = CatalogItem(id: "watched", title: "大王饶命", section: .anime, year: "2021")
+        let duplicate = CatalogItem(id: "provider", title: "大王饶命", section: .anime, year: "2021")
+        let later = CatalogItem(id: "later", title: "大王饶命", section: .anime, year: "2026")
+        let secondSeason = CatalogItem(id: "second", title: "大王饶命第二季", section: .anime, year: "2026")
+        let found = WorkSearchIndex.merge([watched, duplicate, later, secondSeason], query: "大王饶命")
+        XCTAssertEqual(found.count, 3)
+        XCTAssertEqual(found.filter { $0.year == "2021" }.first?.id, "watched")
+        XCTAssertTrue(found.contains { $0.title == "大王饶命第二季" })
+    }
+
+    @MainActor
+    func testOnlyExplicitManualSourceIsRestored() throws {
+        let suiteName = "LunaTVManualSourceTests"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        suite.removePersistentDomain(forName: suiteName)
+        let item = CatalogItem(id: "work", title: "港剧粤语", section: .drama, year: "2026")
+        let store = PersistenceStore(defaults: suite)
+        XCTAssertNil(store.manualSourceID(for: item))
+        store.rememberManualSource("preferred-cantonese", for: item)
+        let reopened = PersistenceStore(defaults: suite)
+        XCTAssertEqual(reopened.manualSourceID(for: item), "preferred-cantonese")
+    }
+
     @MainActor
     func testSharedCatalogQueryMapsHongKongDramaAndCursor() throws {
         let repository = ContentRepository()

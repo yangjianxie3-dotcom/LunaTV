@@ -5,6 +5,7 @@ final class PersistenceStore: ObservableObject {
     @Published private(set) var favorites: [CatalogItem] = []
     @Published private(set) var history: [PlaybackRecord] = []
     @Published private(set) var searchHistory: [String] = []
+    private var manualSourceChoices: [String: String] = [:]
     @Published var preferences = AppPreferences() {
         didSet { save(preferences, key: Keys.preferences) }
     }
@@ -14,6 +15,7 @@ final class PersistenceStore: ObservableObject {
         static let history = "ios.history.v1"
         static let searchHistory = "ios.searchHistory.v1"
         static let preferences = "ios.preferences.v1"
+        static let manualSourceChoices = "ios.manualSourceChoices.v1"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -21,6 +23,7 @@ final class PersistenceStore: ObservableObject {
         favorites = load([CatalogItem].self, key: Keys.favorites) ?? []
         history = load([PlaybackRecord].self, key: Keys.history) ?? []
         searchHistory = load([String].self, key: Keys.searchHistory) ?? []
+        manualSourceChoices = load([String: String].self, key: Keys.manualSourceChoices) ?? [:]
         preferences = load(AppPreferences.self, key: Keys.preferences) ?? AppPreferences()
     }
 
@@ -84,6 +87,20 @@ final class PersistenceStore: ObservableObject {
     func clearSearchHistory() {
         searchHistory = []
         save(searchHistory, key: Keys.searchHistory)
+    }
+
+    func manualSourceID(for item: CatalogItem) -> String? {
+        manualSourceChoices[sourceChoiceKey(for: item)]
+    }
+
+    func rememberManualSource(_ sourceID: String, for item: CatalogItem) {
+        manualSourceChoices[sourceChoiceKey(for: item)] = sourceID
+        save(manualSourceChoices, key: Keys.manualSourceChoices)
+    }
+
+    private func sourceChoiceKey(for item: CatalogItem) -> String {
+        [item.section.rawValue, MediaTitleIdentity.key(for: item.title), item.year]
+            .joined(separator: "|")
     }
 
     private let defaults: UserDefaults

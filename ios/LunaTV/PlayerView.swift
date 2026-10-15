@@ -276,6 +276,7 @@ struct PlayerView: View {
                             Button {
                                 saveProgress()
                                 controller.selectSource(index)
+                                persistence.rememberManualSource(source.id, for: controller.item)
                                 showSources = false
                             } label: {
                                 HStack {

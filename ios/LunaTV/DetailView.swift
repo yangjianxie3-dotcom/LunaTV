@@ -21,7 +21,7 @@ struct DetailView: View {
     @EnvironmentObject private var repository: ContentRepository
     @EnvironmentObject private var persistence: PersistenceStore
     @State private var sources: [PlaybackSource] = []
-    @State private var selectedSourceIndex = 0
+    @State private var selectedSourceIndex: Int?
     @State private var selectedLanguage = "原声"
     @State private var isLoading = true
     @State private var route: PlayerRoute?
@@ -30,7 +30,8 @@ struct DetailView: View {
     @ObservedObject private var network = NetworkMonitor.shared
 
     private var selectedSource: PlaybackSource? {
-        sources.indices.contains(selectedSourceIndex) ? sources[selectedSourceIndex] : nil
+        guard let selectedSourceIndex, sources.indices.contains(selectedSourceIndex) else { return nil }
+        return sources[selectedSourceIndex]
     }
 
     private var availableLanguages: [String] {
@@ -114,7 +115,8 @@ struct DetailView: View {
                     Button {
                         play(episodeIndex: preferredEpisodeIndex())
                     } label: {
-                        Label(preferredEpisodeIndex() > 0 ? "继续播放" : "播放第 1 集",
+                        Label(selectedSource == nil ? "请先选择线路" :
+                              (preferredEpisodeIndex() > 0 ? "继续播放" : "播放第 1 集"),
                               systemImage: "play.fill")
                             .frame(maxWidth: .infinity)
                     }
@@ -159,7 +161,7 @@ struct DetailView: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text("播放线路").font(.headline)
                     Spacer()
-                    Text(isProbing ? "后台测速中，可直接播放" : "已测线路优先 · 其余保留")
+                    Text(isProbing ? "后台测速中 · 请手动选线" : "请手动选线 · 不自动换源")
                         .font(.caption)
                         .foregroundStyle(LunaTheme.secondaryText)
                 }
@@ -170,6 +172,7 @@ struct DetailView: View {
                             let source = option.source
                             Button {
                                 selectedSourceIndex = index
+                                persistence.rememberManualSource(source.id, for: item)
                             } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack(spacing: 6) {
@@ -210,11 +213,15 @@ struct DetailView: View {
                     }
                     .id(source.id)
             }
+        } else if !sources.isEmpty {
+            Text("选择语种和播放线路后可查看分集；不会自动跳到其他线路。")
+                .font(.caption)
+                .foregroundStyle(LunaTheme.secondaryText)
         }
     }
 
     private func play(episodeIndex: Int) {
-        guard !sources.isEmpty, sources.indices.contains(selectedSourceIndex),
+        guard let selectedSourceIndex, sources.indices.contains(selectedSourceIndex),
               sources[selectedSourceIndex].episodes.indices.contains(episodeIndex) else { return }
         sourceTask?.cancel() // Do not compete with playback for media bandwidth.
         isProbing = false
@@ -222,27 +229,10 @@ struct DetailView: View {
                             sourceIndex: selectedSourceIndex, episodeIndex: episodeIndex)
     }
 
-    private func preferredSourceIndex() -> Int {
-        guard let record = persistence.history.first(where: { $0.item.id == item.id }),
-              let index = sources.firstIndex(where: { $0.id == record.sourceID }) else {
-            if item.region.contains("香港"),
-               let cantonese = sources.firstIndex(where: { $0.language == "粤语" }) {
-                return cantonese
-            }
-            if (item.region.contains("中国") || item.region.contains("大陆")),
-               let mandarin = sources.firstIndex(where: { $0.language == "国语" }) {
-                return mandarin
-            }
-            return 0
-        }
-        return index
-    }
-
     private func selectLanguage(_ language: String) {
+        guard selectedLanguage != language else { return }
         selectedLanguage = language
-        if let index = sources.firstIndex(where: { $0.language == language }) {
-            selectedSourceIndex = index
-        }
+        selectedSourceIndex = nil
     }
 
     private func sourceSpeedDescription(_ source: PlaybackSource) -> String {
@@ -284,11 +274,18 @@ struct DetailView: View {
 
     private func applySources(_ values: [PlaybackSource]) {
         guard !values.isEmpty || sources.isEmpty else { return }
+        let firstLoad = sources.isEmpty
         let selectedID = selectedSource?.id
         sources = values
-        selectedSourceIndex = selectedID.flatMap { id in sources.firstIndex { $0.id == id } }
-            ?? preferredSourceIndex()
-        if let source = selectedSource { selectedLanguage = source.language }
+        let restoredID = firstLoad ? persistence.manualSourceID(for: item) : nil
+        selectedSourceIndex = (selectedID ?? restoredID).flatMap { id in
+            sources.firstIndex { $0.id == id }
+        }
+        if let source = selectedSource {
+            selectedLanguage = source.language
+        } else if !availableLanguages.contains(selectedLanguage) {
+            selectedLanguage = availableLanguages.first ?? "原声"
+        }
     }
 
     private func shortEpisodeTitle(_ episode: Episode) -> String {

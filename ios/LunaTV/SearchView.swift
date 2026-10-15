@@ -15,7 +15,7 @@ struct SearchView: View {
             VStack(alignment: .leading, spacing: 18) {
                 NetworkStatusStrip()
                 if isSearching && results.isEmpty {
-                    LoadingStateView(title: "正在查询全部播放源…")
+                    LoadingStateView(title: "正在查找作品与播放源…")
                 } else if let errorMessage {
                     EmptyStateView(title: "搜索失败", message: errorMessage)
                 } else if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -25,7 +25,7 @@ struct SearchView: View {
                                    message: "可重试查询，或尝试完整片名、中文别名、英文名。")
                     Button("重试搜索") { Task { await performSearch() } }.buttonStyle(.bordered)
                 } else {
-                    Text("找到 \(results.count) 部内容\(isSearching ? " · 其余线路查询中" : "")")
+                    Text("找到 \(results.count) 部作品\(isSearching ? " · 正在补充实时片库" : "")")
                         .font(.subheadline)
                         .foregroundStyle(LunaTheme.secondaryText)
                     CatalogGrid(items: results)
@@ -40,12 +40,16 @@ struct SearchView: View {
             persistence.rememberSearch(query)
         }
         .task(id: query) {
-            guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else {
                 results = []
                 isSearching = false
                 errorMessage = nil
                 return
             }
+            results = localResults(for: value)
+            isSearching = true
+            errorMessage = nil
             try? await Task.sleep(for: .milliseconds(450))
             guard !Task.isCancelled else { return }
             await performSearch()
@@ -105,16 +109,23 @@ struct SearchView: View {
     private func performSearch() async {
         let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
+        let local = localResults(for: value)
+        results = local
         isSearching = true
         errorMessage = nil
         let found = await repository.search(value) { partial in
             guard !Task.isCancelled, value == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
-            results = partial
+            results = WorkSearchIndex.merge(local + partial, query: value)
         }
         guard !Task.isCancelled else { return }
         guard value == query.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
-        results = found
+        results = WorkSearchIndex.merge(local + found, query: value)
         isSearching = false
+    }
+
+    private func localResults(for value: String) -> [CatalogItem] {
+        let watched = persistence.history.map(\.item)
+        return WorkSearchIndex.merge(watched + repository.bundledSearch(value), query: value)
     }
 }
 
