@@ -147,6 +147,7 @@ final class ContentRepository: ObservableObject {
     private var catalogCache: [String: CachedCatalog] = [:]
     private var bundledCatalogCache: BundledCatalogRoot?
     private var siteClassCache: [String: [CMSClassEntry]] = [:]
+    private var sharedBatchCapability: (baseURL: String, count: Int?, expiresAt: Date)?
     private let transport = NetworkTransport()
     private var session: URLSession { transport.session }
     private let sharedServiceBaseURLs: [String]
@@ -204,6 +205,7 @@ final class ContentRepository: ObservableObject {
         // Do not wipe posters, paging, selection, history, or healthy catalogue
         // content because the system route changed.
         siteClassCache.removeAll()
+        sharedBatchCapability = nil
     }
 
     private var availableSharedURLs: [String] {
@@ -539,6 +541,8 @@ final class ContentRepository: ObservableObject {
     }
 
     private func sharedBatchCount(baseURL: String) async -> Int? {
+        if let cached = sharedBatchCapability,
+           cached.baseURL == baseURL, cached.expiresAt > Date() { return cached.count }
         guard let url = URL(string: baseURL + "/health") else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.5
@@ -546,9 +550,13 @@ final class ContentRepository: ObservableObject {
             let (data, response) = try await transport.data(for: request)
             try validate(response: response)
             let health = try JSONDecoder().decode(SharedHealthResponse.self, from: data)
-            guard let count = health.catalogSearchBatches, (2...8).contains(count) else { return nil }
+            let count = health.catalogSearchBatches.flatMap { (2...8).contains($0) ? $0 : nil }
+            sharedBatchCapability = (baseURL, count, Date().addingTimeInterval(60))
             return count
-        } catch { return nil }
+        } catch {
+            sharedBatchCapability = (baseURL, nil, Date().addingTimeInterval(10))
+            return nil
+        }
     }
 
     private func fetchSharedWorkSearch(url: URL) async throws ->
