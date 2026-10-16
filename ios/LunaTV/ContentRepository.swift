@@ -68,6 +68,10 @@ final class ContentRepository: ObservableObject {
         let batchCount: Int?
     }
 
+    private struct SharedHealthResponse: Decodable {
+        let catalogSearchBatches: Int?
+    }
+
     private struct SharedWorkSearchItem: Decodable {
         let id: String?
         let workId: String?
@@ -473,20 +477,53 @@ final class ContentRepository: ObservableObject {
 
     private func sharedWorkSearch(_ query: String, limit: Int,
                                   onProgress: (([CatalogItem]) -> Void)? = nil) async throws -> [CatalogItem] {
-        let urls = availableSharedURLs.compactMap { baseURL -> URL? in
+        func searchURL(_ baseURL: String, batch: Int? = nil) -> URL? {
             guard var components = URLComponents(string: baseURL + "/api/catalog/search") else { return nil }
             components.queryItems = [URLQueryItem(name: "q", value: query),
-                                     URLQueryItem(name: "limit", value: String(min(50, max(1, limit)))),
-                                     URLQueryItem(name: "batch", value: "0")]
+                                     URLQueryItem(name: "limit", value: String(min(50, max(1, limit))))]
+            if let batch { components.queryItems?.append(URLQueryItem(name: "batch", value: String(batch))) }
             return components.url
         }
+        let urls = availableSharedURLs.compactMap { searchURL($0) }
         guard !urls.isEmpty else { throw RepositoryError.invalidConfiguration }
-        let first = try await withThrowingTaskGroup(of: (URL, [CatalogItem], Int?)?.self) { group in
+        // The primary mainland-reachable route advertises batch support.
+        // Check it briefly before launching all batches together; old servers
+        // receive one original full scan rather than four duplicate scans.
+        if let primary = availableSharedURLs.first,
+           let batchCount = await sharedBatchCount(baseURL: primary) {
+            var works: [CatalogItem] = []
+            var failed = false
+            await withTaskGroup(of: (Int, [CatalogItem]?).self) { group in
+                for batch in 0..<batchCount {
+                    guard let url = searchURL(primary, batch: batch) else { failed = true; continue }
+                    group.addTask { [weak self] in
+                        guard let self,
+                              let result = try? await self.fetchSharedWorkSearch(url: url),
+                              result.batch == batch, result.batchCount == batchCount else {
+                            return (batch, nil)
+                        }
+                        return (batch, result.items)
+                    }
+                }
+                for await (_, partial) in group {
+                    guard !Task.isCancelled else { group.cancelAll(); break }
+                    if let partial {
+                        works.append(contentsOf: partial)
+                        onProgress?(works)
+                    } else { failed = true }
+                }
+            }
+            if !failed, !Task.isCancelled { return works }
+            // A failed batch must not make a partial library look complete.
+            // The already displayed works remain visible while the original
+            // full request retries through all configured service routes.
+        }
+        let full = try await withThrowingTaskGroup(of: [CatalogItem]?.self) { group in
             for url in urls {
                 group.addTask { [weak self] in
                     guard let self else { return nil }
                     guard let result = try? await self.fetchSharedWorkSearch(url: url) else { return nil }
-                    return (url, result.items, result.batchCount)
+                    return result.items
                 }
             }
             for try await result in group {
@@ -497,43 +534,25 @@ final class ContentRepository: ObservableObject {
             }
             throw RepositoryError.invalidResponse
         }
-        var works = first.1
-        onProgress?(works)
-        guard let batchCount = first.2, batchCount > 1, batchCount <= 8 else { return works }
-        var failed = false
-        await withTaskGroup(of: [CatalogItem]?.self) { group in
-            for batch in 1..<batchCount {
-                guard var components = URLComponents(url: first.0, resolvingAgainstBaseURL: false) else { continue }
-                components.queryItems = components.queryItems?.map { item in
-                    item.name == "batch" ? URLQueryItem(name: "batch", value: String(batch)) : item
-                }
-                guard let url = components.url else { continue }
-                group.addTask { [weak self] in
-                    guard let self else { return nil }
-                    guard let result = try? await self.fetchSharedWorkSearch(url: url) else { return nil }
-                    return result.items
-                }
-            }
-            for await batch in group {
-                guard !Task.isCancelled else { group.cancelAll(); break }
-                if let batch {
-                    works.append(contentsOf: batch)
-                    onProgress?(works)
-                } else { failed = true }
-            }
-        }
-        if failed, var components = URLComponents(url: first.0, resolvingAgainstBaseURL: false) {
-            components.queryItems?.removeAll { $0.name == "batch" }
-            if let url = components.url,
-               let full = try? await fetchSharedWorkSearch(url: url) {
-                onProgress?(full.items)
-                return full.items
-            }
-        }
-        return works
+        onProgress?(full)
+        return full
     }
 
-    private func fetchSharedWorkSearch(url: URL) async throws -> (items: [CatalogItem], batchCount: Int?) {
+    private func sharedBatchCount(baseURL: String) async -> Int? {
+        guard let url = URL(string: baseURL + "/health") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+        do {
+            let (data, response) = try await transport.data(for: request)
+            try validate(response: response)
+            let health = try JSONDecoder().decode(SharedHealthResponse.self, from: data)
+            guard let count = health.catalogSearchBatches, (2...8).contains(count) else { return nil }
+            return count
+        } catch { return nil }
+    }
+
+    private func fetchSharedWorkSearch(url: URL) async throws ->
+        (items: [CatalogItem], batch: Int?, batchCount: Int?) {
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
         let (data, response) = try await transport.data(for: request)
@@ -555,7 +574,7 @@ final class ContentRepository: ObservableObject {
                                section: section, category: type, genre: type,
                                year: row.year?.value ?? "", sourceLabel: "共享实时作品搜索")
         }
-        return (items, payload.batch == nil ? nil : payload.batchCount)
+        return (items, payload.batch, payload.batchCount)
     }
 
     func bundledSearch(_ query: String, limit: Int = 60) -> [CatalogItem] {
