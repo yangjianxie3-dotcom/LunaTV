@@ -64,6 +64,8 @@ final class ContentRepository: ObservableObject {
 
     private struct SharedWorkSearchResponse: Decodable {
         let list: [SharedWorkSearchItem]
+        let batch: Int?
+        let batchCount: Int?
     }
 
     private struct SharedWorkSearchItem: Decodable {
@@ -452,7 +454,9 @@ final class ContentRepository: ObservableObject {
         guard !keyword.isEmpty else { return [] }
         let local = bundledSearch(keyword, limit: limit)
         onProgress?(local)
-        if !Task.isCancelled, let live = try? await sharedWorkSearch(keyword, limit: limit), !live.isEmpty {
+        if !Task.isCancelled, let live = try? await sharedWorkSearch(keyword, limit: limit, onProgress: { partial in
+            onProgress?(WorkSearchIndex.merge(partial + local, query: keyword, limit: limit))
+        }), !live.isEmpty {
             let works = WorkSearchIndex.merge(live + local, query: keyword, limit: limit)
             onProgress?(works)
             return works
@@ -467,19 +471,22 @@ final class ContentRepository: ObservableObject {
         return WorkSearchIndex.merge(local + results.map(\.item), query: keyword, limit: limit)
     }
 
-    private func sharedWorkSearch(_ query: String, limit: Int) async throws -> [CatalogItem] {
+    private func sharedWorkSearch(_ query: String, limit: Int,
+                                  onProgress: (([CatalogItem]) -> Void)? = nil) async throws -> [CatalogItem] {
         let urls = availableSharedURLs.compactMap { baseURL -> URL? in
             guard var components = URLComponents(string: baseURL + "/api/catalog/search") else { return nil }
             components.queryItems = [URLQueryItem(name: "q", value: query),
-                                     URLQueryItem(name: "limit", value: String(min(50, max(1, limit))))]
+                                     URLQueryItem(name: "limit", value: String(min(50, max(1, limit)))),
+                                     URLQueryItem(name: "batch", value: "0")]
             return components.url
         }
         guard !urls.isEmpty else { throw RepositoryError.invalidConfiguration }
-        return try await withThrowingTaskGroup(of: [CatalogItem]?.self) { group in
+        let first = try await withThrowingTaskGroup(of: (URL, [CatalogItem], Int?)?.self) { group in
             for url in urls {
                 group.addTask { [weak self] in
                     guard let self else { return nil }
-                    return try? await self.fetchSharedWorkSearch(url: url)
+                    guard let result = try? await self.fetchSharedWorkSearch(url: url) else { return nil }
+                    return (url, result.items, result.batchCount)
                 }
             }
             for try await result in group {
@@ -490,15 +497,49 @@ final class ContentRepository: ObservableObject {
             }
             throw RepositoryError.invalidResponse
         }
+        var works = first.1
+        onProgress?(works)
+        guard let batchCount = first.2, batchCount > 1, batchCount <= 8 else { return works }
+        var failed = false
+        await withTaskGroup(of: [CatalogItem]?.self) { group in
+            for batch in 1..<batchCount {
+                guard var components = URLComponents(url: first.0, resolvingAgainstBaseURL: false) else { continue }
+                components.queryItems = components.queryItems?.map { item in
+                    item.name == "batch" ? URLQueryItem(name: "batch", value: String(batch)) : item
+                }
+                guard let url = components.url else { continue }
+                group.addTask { [weak self] in
+                    guard let self else { return nil }
+                    guard let result = try? await self.fetchSharedWorkSearch(url: url) else { return nil }
+                    return result.items
+                }
+            }
+            for await batch in group {
+                guard !Task.isCancelled else { group.cancelAll(); break }
+                if let batch {
+                    works.append(contentsOf: batch)
+                    onProgress?(works)
+                } else { failed = true }
+            }
+        }
+        if failed, var components = URLComponents(url: first.0, resolvingAgainstBaseURL: false) {
+            components.queryItems?.removeAll { $0.name == "batch" }
+            if let url = components.url,
+               let full = try? await fetchSharedWorkSearch(url: url) {
+                onProgress?(full.items)
+                return full.items
+            }
+        }
+        return works
     }
 
-    private func fetchSharedWorkSearch(url: URL) async throws -> [CatalogItem] {
+    private func fetchSharedWorkSearch(url: URL) async throws -> (items: [CatalogItem], batchCount: Int?) {
         var request = URLRequest(url: url)
         request.setValue(AppVersion.userAgent(), forHTTPHeaderField: "User-Agent")
         let (data, response) = try await transport.data(for: request)
         try validate(response: response)
         let payload = try JSONDecoder().decode(SharedWorkSearchResponse.self, from: data)
-        return payload.list.compactMap { row -> CatalogItem? in
+        let items = payload.list.compactMap { row -> CatalogItem? in
             let title = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !title.isEmpty else { return nil }
             let workID = row.workId?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -514,6 +555,7 @@ final class ContentRepository: ObservableObject {
                                section: section, category: type, genre: type,
                                year: row.year?.value ?? "", sourceLabel: "共享实时作品搜索")
         }
+        return (items, payload.batch == nil ? nil : payload.batchCount)
     }
 
     func bundledSearch(_ query: String, limit: Int = 60) -> [CatalogItem] {
