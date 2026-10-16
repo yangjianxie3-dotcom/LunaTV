@@ -488,6 +488,7 @@ final class ContentRepository: ObservableObject {
         }
         let urls = availableSharedURLs.compactMap { searchURL($0) }
         guard !urls.isEmpty else { throw RepositoryError.invalidConfiguration }
+        var discovered: [CatalogItem] = []
         // The primary mainland-reachable route advertises batch support.
         // Check it briefly before launching all batches together; old servers
         // receive one original full scan rather than four duplicate scans.
@@ -515,29 +516,39 @@ final class ContentRepository: ObservableObject {
                     } else { failed = true }
                 }
             }
-            if !failed, !Task.isCancelled { return works }
+            if Task.isCancelled || !failed { return works }
+            discovered = works
             // A failed batch must not make a partial library look complete.
             // The already displayed works remain visible while the original
             // full request retries through all configured service routes.
         }
-        let full = try await withThrowingTaskGroup(of: [CatalogItem]?.self) { group in
-            for url in urls {
-                group.addTask { [weak self] in
-                    guard let self else { return nil }
-                    guard let result = try? await self.fetchSharedWorkSearch(url: url) else { return nil }
-                    return result.items
+        let full: [CatalogItem]
+        do {
+            full = try await withThrowingTaskGroup(of: [CatalogItem]?.self) { group in
+                for url in urls {
+                    group.addTask { [weak self] in
+                        guard let self else { return nil }
+                        guard let result = try? await self.fetchSharedWorkSearch(url: url) else { return nil }
+                        return result.items
+                    }
                 }
-            }
-            for try await result in group {
-                if let result {
-                    group.cancelAll()
-                    return result
+                for try await result in group {
+                    if let result {
+                        group.cancelAll()
+                        return result
+                    }
                 }
+                throw RepositoryError.invalidResponse
             }
-            throw RepositoryError.invalidResponse
+        } catch {
+            if !discovered.isEmpty { return discovered }
+            throw error
         }
-        onProgress?(full)
-        return full
+        // A successful rescue request may still omit a provider that answered
+        // in an earlier batch. WorkSearchIndex merges exact work identities.
+        let combined = full + discovered
+        onProgress?(combined)
+        return combined
     }
 
     private func sharedBatchCount(baseURL: String) async -> Int? {
